@@ -1,0 +1,8 @@
+[bindings.kotlin]
+package_name = "com.pubky.sdk"
+cdylib_name = "pubky_sdk"
+
+[bindings.swift]
+module_name = "PubkySDK"
+cdylib_name = "pubky_sdk"
+

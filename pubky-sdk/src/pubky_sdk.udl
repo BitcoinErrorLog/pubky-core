@@ -1,0 +1,90 @@
+namespace pubky_sdk {};
+
+[Error]
+enum PubkyError {
+    "Auth",
+    "Request",
+    "Build",
+    "InvalidInput",
+    "Network",
+    "Unknown",
+};
+
+dictionary SessionInfo {
+    string pubkey;
+    string? session_secret;
+    sequence<string> capabilities;
+    u64 created_at;
+    u64? expires_at;
+};
+
+dictionary SignupOptions {
+    sequence<string>? capabilities;
+    u64? signup_token;
+};
+
+dictionary AuthFlowInfo {
+    string authorization_url;
+    string request_id;
+};
+
+dictionary ListItem {
+    string name;
+    boolean is_directory;
+};
+
+[Trait, WithForeign]
+interface KeyProvider {
+    [Throws=PubkyError]
+    sequence<u8> secret_key();
+};
+
+interface Sdk {
+    constructor();
+    
+    [Throws=PubkyError]
+    PubkySession signin(KeyProvider key_provider, string homeserver);
+    
+    [Throws=PubkyError]
+    PubkySession signup(KeyProvider key_provider, string homeserver, SignupOptions? options);
+    
+    [Throws=PubkyError]
+    AuthFlowInfo start_auth_flow(sequence<string> capabilities);
+    
+    [Throws=PubkyError]
+    PubkySession await_approval(string request_id);
+    
+    PublicStorage public_storage();
+};
+
+interface PubkySession {
+    SessionInfo info();
+    
+    SessionStorage storage();
+    
+    [Throws=PubkyError]
+    void signout();
+};
+
+interface SessionStorage {
+    [Throws=PubkyError]
+    sequence<u8> get(string path);
+    
+    [Throws=PubkyError]
+    void put(string path, sequence<u8> content);
+    
+    [Throws=PubkyError]
+    void delete(string path);
+    
+    [Throws=PubkyError]
+    sequence<ListItem> list(string path);
+};
+
+interface PublicStorage {
+    [Throws=PubkyError]
+    sequence<u8> get(string uri);
+    
+    [Throws=PubkyError]
+    sequence<ListItem> list(string uri);
+};
+
