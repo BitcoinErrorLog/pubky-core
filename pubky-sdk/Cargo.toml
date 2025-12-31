@@ -21,11 +21,13 @@ categories = [
 ]
 
 [lib]
-crate-type = ["rlib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
 default = []
 json = ["dep:serde", "reqwest/json"]
+uniffi_macros = ["dep:uniffi", "dep:async-compat"]
+bindgen-cli = ["dep:uniffi_bindgen", "dep:clap", "dep:camino", "dep:anyhow"]
 
 [dependencies]
 pubky-common = { path = "../pubky-common", version = "0.6.0-rc.6" }
@@ -39,6 +41,13 @@ futures-util = "0.3.31"
 serde = { version = "1", features = ["derive"], optional = true }
 httpdate = "1"
 web-time = "1.1.0"
+# UniFFI 0.29.4 for iOS/Android FFI bindings - must match paykit-mobile version
+uniffi = { version = "0.29.4", features = ["cli", "bindgen", "tokio"], optional = true }
+async-compat = { version = "0.2", optional = true }
+uniffi_bindgen = { version = "0.29.4", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+camino = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "0.12.12", default-features = false, features = [

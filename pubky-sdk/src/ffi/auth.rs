@@ -3,7 +3,7 @@
 use crate::ffi::errors::FfiPubkyError;
 use crate::ffi::types::{FfiKeyProvider, FfiSignupOptions, FfiAuthFlowInfo};
 use crate::ffi::session::FfiPubkySession;
-use crate::{Pubky, Capabilities};
+use crate::{Pubky, Capabilities, AuthFlowKind};
 use pkarr::{Keypair, PublicKey};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -95,7 +95,7 @@ impl FfiSdk {
         
         let caps = caps_builder.finish();
         
-        let flow = self.inner.start_auth_flow(&caps)
+        let flow = self.inner.start_auth_flow(&caps, AuthFlowKind::SignIn)
             .map_err(FfiPubkyError::from)?;
         
         let auth_url = flow.authorization_url().to_string();

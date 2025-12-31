@@ -1,7 +1,9 @@
+#[cfg(feature = "bindgen-cli")]
 use anyhow::Result;
 use std::env;
 use std::process::Command;
 
+#[cfg(feature = "bindgen-cli")]
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     
@@ -44,3 +46,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "bindgen-cli"))]
+fn main() {
+    eprintln!("This binary requires the 'bindgen-cli' feature.");
+    eprintln!("Run with: cargo run --bin uniffi_bindgen --features bindgen-cli");
+    std::process::exit(1);
+}

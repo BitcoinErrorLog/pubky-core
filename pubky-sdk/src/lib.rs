@@ -19,6 +19,12 @@ mod macros;
 
 mod util;
 
+// FFI module for iOS/Android bindings
+#[cfg(feature = "uniffi_macros")]
+mod ffi;
+#[cfg(feature = "uniffi_macros")]
+uniffi::setup_scaffolding!();
+
 pub mod prelude;
 
 // --- PUBLIC API EXPORTS ---
