@@ -56,6 +56,14 @@ impl Keypair {
             pubky_common::recovery_file::decrypt_recovery_file(recovery_file, passphrase)?;
         Ok(Keypair::from(keypair))
     }
+
+    /// Sign a message with this keypair's secret key.
+    /// Returns the 64-byte Ed25519 signature.
+    #[wasm_bindgen]
+    pub fn sign(&self, message: &[u8]) -> Uint8Array {
+        let signature = self.0.sign(message);
+        Uint8Array::from(signature.to_bytes().as_ref())
+    }
 }
 
 impl Keypair {

@@ -9,6 +9,20 @@ For deeper dives, check out the
 [examples/javascript](../../../examples/javascript) scripts and the
 [npm package documentation](pkg/README.md).
 
+## Build Requirements
+
+This crate only compiles for the `wasm32-unknown-unknown` target. Running `cargo check` or `cargo build` without specifying the target will fail with errors about missing types.
+
+Build with wasm-pack (recommended):
+```bash
+wasm-pack build --target web
+```
+
+Or with cargo directly:
+```bash
+cargo build --target wasm32-unknown-unknown
+```
+
 ## Development quick start
 
 Prerequisites:
@@ -16,6 +30,7 @@ Prerequisites:
 - Rust toolchain (via [`rustup`](https://rustup.rs/)).
 - Wasm-pack `cargo install wasm-pack`.
 - Node.js v20+.
+- wasm32 target: `rustup target add wasm32-unknown-unknown`.
 
 Then from `pubky-sdk/bindings/js/pkg`:
 
