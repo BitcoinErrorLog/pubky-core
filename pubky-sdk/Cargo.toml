@@ -26,14 +26,17 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [features]
 default = []
 json = ["dep:serde", "reqwest/json"]
-uniffi_macros = ["dep:uniffi", "dep:async-compat"]
+uniffi_macros = ["dep:uniffi", "dep:async-compat", "dep:pubky-noise"]
 bindgen-cli = ["dep:uniffi_bindgen", "dep:clap", "dep:camino", "dep:anyhow"]
 
 [dependencies]
 pubky-common = { path = "../pubky-common", version = "0.6.0-rc.6" }
+# pubky-noise for crypto functions (X25519, Sealed Blob, Ed25519)
+pubky-noise = { path = "../../pubky-noise", optional = true }
 thiserror = "2.0.11"
 url = "2.5.4"
 base64 = "0.22.1"
+hex = "0.4"
 pkarr = { workspace = true, features = ["full"] }
 cookie = "0.18.1"
 flume = { version = "0.11.1", default-features = false, features = ["async"] }
