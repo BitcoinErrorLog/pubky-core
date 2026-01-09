@@ -1,6 +1,6 @@
 # Pubky Cryptographic Specification
 
-**Version**: 2.0  
+**Version**: 2.1  
 **Date**: January 2026  
 **Status**: Authoritative Reference
 
@@ -16,8 +16,12 @@ This specification defines the cryptographic primitives, key derivation schemes,
 4. [Key Hierarchy and Derivation](#4-key-hierarchy-and-derivation)
 5. [Device Authorization](#5-device-authorization)
 6. [Live Transport (Noise Protocol)](#6-live-transport-noise-protocol)
-7. [Async Messaging (Outbox Envelopes)](#7-async-messaging-outbox-envelopes)
+7. [Async Messaging (Async Envelopes)](#7-async-messaging-async-envelopes)
+   - 7.7 [ContextId Definition](#77-contextid-definition)
+   - 7.8 [Storage Layout](#78-storage-layout-paykit-v0)
+   - 7.9 [Encrypted ACK Protocol](#79-encrypted-ack-protocol)
 8. [Session and Message Binding](#8-session-and-message-binding)
+   - 8.4 [ContextId vs SessionId](#84-contextid-vs-sessionid)
 9. [Key Rotation](#9-key-rotation)
 10. [Backup and Restore](#10-backup-and-restore)
 11. [Security Considerations](#11-security-considerations)
@@ -198,6 +202,30 @@ LOCAL_ARCHIVE_KEY = HKDF-SHA256(
 
 This key encrypts local data only. MUST NOT be used for outbox envelopes.
 
+### 4.7 Domain Separation for Single X25519 Key (MVP)
+
+For MVP, devices publish a **single X25519 static public key** that serves both:
+- Live Noise transport sessions (Noise_XX, Noise_IK patterns)
+- Sealed Blob envelopes (async encrypted messages)
+
+This is safe due to **strict domain separation**:
+
+| Protocol | HKDF Info String | Nonce Size | AEAD |
+|----------|------------------|------------|------|
+| Noise Transport | (per Noise spec) | 12 bytes | ChaCha20-Poly1305 |
+| Sealed Blob v2 | `"pubky-envelope/v2"` | 24 bytes | XChaCha20-Poly1305 |
+
+**Security guarantees**:
+- Different HKDF info strings produce unrelated derived keys
+- Different nonce sizes prevent cross-protocol nonce reuse
+- AAD binds envelope ciphertext to storage context
+
+**Future migration path**: If stronger isolation is required, split into:
+- `InboxKey`: X25519 for Sealed Blob envelopes only
+- `TransportKey`: X25519 for Noise sessions only
+
+Both keys can be published in PKARR metadata without breaking identity.
+
 ---
 
 ## 5. Device Authorization
@@ -324,7 +352,7 @@ Implementations MAY persist:
 
 ---
 
-## 7. Async Messaging (Outbox Envelopes)
+## 7. Async Messaging (Async Envelopes)
 
 ### 7.1 Purpose
 
@@ -336,11 +364,11 @@ When both parties are not online simultaneously, messages are stored encrypted o
 {
   "v": 2,
   "epk": "<base64url: sender ephemeral X25519 public key, 32 bytes>",
-  "sender": "<base64url: sender PKARR public key, 32 bytes, optional>",
+  "sender": "<z-base-32: sender PKARR public key, optional, untrusted unless sig present>",
   "nonce": "<base64url: 24 bytes for XChaCha20>",
   "ct": "<base64url: ciphertext + 16-byte Poly1305 tag>",
   "kid": "<hex: first 8 bytes of SHA256(recipient_pk), optional>",
-  "kind": "<u16: message kind, optional>",
+  "purpose": "<string: hint only, e.g. 'handoff', 'request', 'proposal'>",
   "sig": "<base64url: Ed25519 signature, 64 bytes, optional>"
 }
 ```
@@ -364,13 +392,36 @@ key = HKDF-SHA256(
 
 ### 7.5 AAD Construction
 
+AAD binds ciphertext to its storage context and owner, preventing relocation attacks.
+
+**Paykit AAD Format (Normative)**:
+
 ```
-aad = purpose || ":" || owner_pkarr_z32 || ":" || storage_path || ":" || msg_id
+aad = "paykit:v0:" || purpose || ":" || owner_z32 || ":" || path || ":" || id
 ```
 
-Examples:
-- `handoff:8um71us...xyz:/pub/paykit.app/v0/handoff/abc123:abc123`
-- `outbox:8um71us...xyz:/pub/paykit.app/v0/outbox/peer123/msg456:msg456`
+Where:
+- `purpose`: Object type (`request`, `subscription_proposal`, `ack_request`, `ack_subscription_proposal`, `handoff`)
+- `owner_z32`: Normalized z-base-32 pubkey of the storage owner (who writes the object)
+- `path`: Full storage path (e.g., `/pub/paykit.app/v0/requests/{context_id}/{id}`)
+- `id`: Object identifier (request_id, proposal_id, msg_id)
+
+**Examples**:
+
+Payment request (sender writes to their storage):
+```
+paykit:v0:request:8um71us...xyz:/pub/paykit.app/v0/requests/abcd1234.../req_001:req_001
+```
+
+Encrypted ACK (recipient writes to their storage):
+```
+paykit:v0:ack_request:tj1igr...abc:/pub/paykit.app/v0/acks/request/abcd1234.../req_001:req_001
+```
+
+Secure handoff (Ring user writes to their storage):
+```
+paykit:v0:handoff:8um71us...xyz:/pub/paykit.app/v0/handoff/abc123:abc123
+```
 
 ### 7.6 Optional Sender Signature
 
@@ -379,21 +430,93 @@ For messages requiring strong sender authenticity:
 ```
 sig = Ed25519_Sign(
   sender_ed25519_sk,
-  BLAKE3("pubky-envelope-sig/v2" || v || epk || sender || nonce || ct || kind)
+  BLAKE3("pubky-envelope-sig/v2" || v || epk || sender || nonce || ct)
 )
 ```
 
-### 7.7 Storage Layout
+### 7.7 ContextId Definition
+
+ContextId provides a stable, symmetric identifier for a peer pair, used in storage paths for routing and correlation.
+
+**Derivation**:
 
 ```
-/pub/paykit.app/v0/outbox/{recipient_z32}/{msg_id}.pke
+context_id = hex(SHA256("paykit:v0:context:" || first_z32 || ":" || second_z32))
 ```
 
-- `recipient_z32`: z-base-32 encoded recipient PKARR public key
-- `msg_id`: 16 or 32 bytes random, hex or base32 encoded
-- `.pke`: Pubky Encrypted Envelope
+Where:
+- `first_z32` and `second_z32` are normalized z-base-32 pubkeys sorted lexicographically
+- Result is 64-character lowercase hex string
+- Symmetric: same value regardless of which party computes it
 
-### 7.8 Message Kinds
+**Normalization rules**:
+1. Trim whitespace
+2. Strip `pubky://` prefix if present
+3. Strip `pk:` prefix if present
+4. Lowercase
+5. Validate length (52 chars) and z-base-32 alphabet
+
+### 7.8 Storage Layout (Paykit v0)
+
+| Object Type | Path | Stored On |
+|-------------|------|-----------|
+| Payment Request | `/pub/paykit.app/v0/requests/{context_id}/{request_id}` | Sender |
+| Subscription Proposal | `/pub/paykit.app/v0/subscriptions/proposals/{context_id}/{proposal_id}` | Provider |
+| ACK | `/pub/paykit.app/v0/acks/{object_type}/{context_id}/{msg_id}` | Receiver |
+| Noise Endpoint | `/pub/paykit.app/v0/noise` | Owner |
+| Secure Handoff | `/pub/paykit.app/v0/handoff/{request_id}` | Ring User |
+
+**Notes**:
+- `context_id`: 64-char hex derived from sender + recipient pubkeys (see 7.7)
+- `object_type`: `request` or `subscription_proposal`
+- All objects except Noise Endpoint are Sealed Blob v2 encrypted
+
+### 7.9 Encrypted ACK Protocol
+
+ACKs confirm receipt of async messages, enabling reliable delivery without active connections.
+
+**ACK Payload**:
+
+```json
+{
+  "acked": true,
+  "acked_at": 1704067200,
+  "msg_id": "req_123",
+  "object_type": "request"
+}
+```
+
+**ACK Encryption**:
+
+ACKs are Sealed Blob v2 encrypted to the **original sender's** published X25519 key (from their `/pub/paykit.app/v0/noise` endpoint).
+
+**ACK Lifecycle**:
+
+1. Receiver decrypts and accepts message (payment request or subscription proposal)
+2. Receiver discovers sender's Noise X25519 pubkey via their noise endpoint
+3. Receiver encrypts ACK payload to sender's X25519 key with proper AAD
+4. Receiver writes encrypted ACK to their own storage at `/pub/paykit.app/v0/acks/{object_type}/{context_id}/{msg_id}`
+5. Sender polls receiver's ACK directory until ACK found or `expires_at` elapsed
+6. Sender decrypts ACK with their own Noise secret key
+7. Sender stops resending after ACK or expiration
+8. ACKs are cleaned up by receiver after 7 days (configurable)
+
+**ACK AAD Construction**:
+
+The ACK's `msg_id` equals the original object's identifier (e.g., `request_id` or `proposal_id`).
+
+Example AAD for ACKing payment request `req_001`:
+```
+paykit:v0:ack_request:tj1igr...abc:/pub/paykit.app/v0/acks/request/abcd1234.../req_001:req_001
+```
+
+### 7.10 Message Kinds (Reserved/Future)
+
+The `kind` field is **not part of Sealed Blob v2**. It is reserved for a potential future typed message routing protocol.
+
+Current Paykit implementations use the `purpose` field (a string hint in the envelope) for message type discrimination. The `purpose` field has no cryptographic binding and is informational only.
+
+**Reserved kind ranges (future use)**:
 
 | Range | Purpose |
 |-------|---------|
@@ -402,19 +525,7 @@ sig = Ed25519_Sign(
 | 200-299 | Pubky App (social, follows, posts) |
 | 0xFF00-0xFFFF | Extensions |
 
-Paykit-specific kinds:
-| Kind | Name |
-|------|------|
-| 100 | PAYMENT_REQUEST |
-| 101 | PAYMENT_RESPONSE |
-| 102 | SUBSCRIPTION_PROPOSAL |
-| 103 | SUBSCRIPTION_ACCEPT |
-| 104 | SUBSCRIPTION_REJECT |
-| 105 | RECEIPT |
-| 106 | ACK |
-| 199 | ERROR |
-
-### 7.9 Replay and Idempotency
+### 7.11 Replay and Idempotency
 
 Recipients MUST:
 - Treat `msg_id` as idempotency key
@@ -446,6 +557,14 @@ For async envelopes:
 Live transport: Ed25519 public key from verified `IdentityPayload`
 Async envelope: `sender` field (must be verified against signature if present)
 
+### 8.4 ContextId vs SessionId
+
+- **SessionId**: Derived from Noise handshake transcript hash. Changes on every new handshake. Only available after handshake completes. Used for live session binding.
+
+- **ContextId**: Derived from peer pubkey pair (Section 7.7). Stable across handshakes. Used for storage path routing, app-level correlation, and ACK bookkeeping.
+
+**Important**: ContextId MUST NOT be used to resume half-complete Noise handshakes. Noise provides no built-in handshake resume; ContextId is strictly for app-layer routing and correlation.
+
 ---
 
 ## 9. Key Rotation
@@ -458,18 +577,23 @@ When rotating Noise static keys:
 3. Publish new public key to PKARR (optional)
 4. Accept messages encrypted to old epoch during grace period
 
-### 9.2 Epoch Fallback
+### 9.2 Key Selection for Envelopes
 
-When decrypting envelopes:
-```
-for epoch in [current, current-1, current-2]:
-    sk = derive_noise_static(epoch)
-    if decrypt(envelope, sk).is_ok():
-        return plaintext
-return DecryptionError
-```
+When decrypting envelopes, use the `kid` field for key selection:
 
-Grace window: 2-3 previous epochs.
+1. If envelope contains `kid`:
+   - Look up `kid` in local keyring: `{ kid -> X25519_sk }`
+   - Decrypt with matched key
+   - If no match, return `KeyNotFound`
+
+2. If envelope lacks `kid` (legacy v1):
+   - Try current epoch key only
+   - If fails, return `DecryptionFailed`
+
+**Keyring maintenance**:
+- Maintain mapping `{ kid -> sk }` for current and N previous epochs
+- Retain old keys for ACK TTL period (default 7 days)
+- Prune expired keys after grace period
 
 ### 9.3 PKARR Publication
 
@@ -588,6 +712,8 @@ Test vectors for interoperability testing are defined in `pubky-noise/tests/`.
 | Identity binding prefix | `"pubky-noise-bind:v1"` |
 | Envelope key info | `"pubky-envelope/v2"` |
 | Envelope signature prefix | `"pubky-envelope-sig/v2"` |
+| ContextId prefix | `"paykit:v0:context:"` |
+| Paykit AAD prefix | `"paykit:v0:"` |
 
 ---
 
@@ -613,20 +739,29 @@ This section documents gaps between the spec and current implementation.
 |---------|--------|----------|
 | X25519 derivation with device_id + epoch | ✅ Implemented | `pubky-noise/src/kdf.rs` |
 | Session ID from handshake hash | ✅ Implemented | `pubky-noise/src/session_id.rs` |
-| Sealed Blob encryption | ✅ Implemented | `pubky-noise/src/sealed_blob.rs` |
+| Sealed Blob v2 encryption | ✅ Implemented | `pubky-noise/src/sealed_blob.rs` |
 | RingKeyProvider trait | ✅ Implemented | `pubky-noise/src/ring.rs` |
 | Identity binding in handshake | ✅ Implemented | `pubky-noise/src/identity_payload.rs` |
 | Secure handoff (Ring → Bitkit) | ✅ Implemented | `pubky-ring/src/utils/actions/paykitConnectAction.ts` |
+| Domain separation (single X25519 key) | ✅ Specified | Section 4.7 |
 
-### C.2 Not Yet Implemented
+### C.2 Specified (Pending Implementation)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| ContextId derivation | 📋 Specified | Section 7.7; requires `paykit-lib` implementation |
+| Owner-bound AAD | 📋 Specified | Section 7.5; requires protocol updates |
+| Encrypted ACK protocol | 📋 Specified | Section 7.9; requires app integration |
+
+### C.3 Not Yet Implemented
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | APP_SEED derivation layer | ❌ Not implemented | Currently uses ed25519 seed directly |
 | Role parameter in X25519 derivation | ❌ Not implemented | Info is `device_id \|\| epoch` only |
 | LOCAL_ARCHIVE_KEY derivation | ❌ Not implemented | Needs new function in kdf.rs |
-| Epoch fallback decryption | ❌ Not implemented | Single epoch only |
-| Message kind field in envelopes | ❌ Not implemented | Purpose field exists but not typed |
+| kid-based key selection | ❌ Not implemented | Uses single epoch; keyring lookup needed |
+| Message kind field in envelopes | ❌ Not implemented | Replaced by `purpose` (hint-only string) |
 
 ---
 
