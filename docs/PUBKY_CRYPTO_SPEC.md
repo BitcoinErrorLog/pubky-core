@@ -1,6 +1,6 @@
 # Pubky Cryptographic Specification
 
-**Version**: 2.3  
+**Version**: 2.4  
 **Date**: January 2026  
 **Status**: Authoritative Reference
 
@@ -31,7 +31,7 @@ This specification defines the cryptographic primitives, key derivation schemes,
    - 7.12 [Canonical Encoding Rules](#712-canonical-encoding-rules)
    - 7.13 [Resend Defaults](#713-resend-defaults-paykit)
 8. [Session and Message Binding](#8-session-and-message-binding)
-   - 8.4 [ContextId vs SessionId](#84-contextid-vs-sessionid)
+   - 8.4 [ContextId vs SessionId vs PairContextId](#84-contextid-vs-sessionid-vs-paircontextid)
    - 8.5 [PeerPairFingerprint](#85-peerpairfingerprint)
 9. [Key Rotation](#9-key-rotation)
 10. [Backup and Restore](#10-backup-and-restore)
@@ -71,7 +71,7 @@ This specification defines the cryptographic primitives, key derivation schemes,
 - Message confidentiality against homeserver and passive observers
 - Message integrity and sender authenticity when signatures present
 - Replay resistance and idempotency at application layer
-- **No double encryption**: Stored messages use Sealed Blob only; live messages use Noise only. Wrapping Sealed Blob in Noise or storing Noise ciphertext as Sealed Blob payload is PROHIBITED in shipped code paths.
+- **No stored Noise ciphertext**: MUST NOT store Noise transport ciphertext for offline delivery. Noise is live-only.
 
 ### 1.4 Live Transport vs Stored Delivery
 
@@ -85,14 +85,21 @@ The Pubky protocol distinguishes between two delivery modes:
 **Invariants**:
 1. Live transport uses Noise and encrypts plaintext message schemas
 2. Stored delivery uses Sealed Blob and encrypts plaintext message schemas
-3. MUST NOT store queued Noise ciphertext on the homeserver
-4. MUST NOT double-encrypt (Sealed Blob inside Noise or Noise ciphertext inside Sealed Blob)
+3. MUST NOT store queued Noise ciphertext on the homeserver for later decryption
+4. MUST NOT wrap Sealed Blob inside Noise for stored delivery (anti-pattern: storing Noise-encrypted Sealed Blobs)
+
+**Allowed Exception (Backup Transport)**:
+
+Noise channels MAY be used to transfer already-encrypted backup blobs as a **live transport mechanism**:
+- Blobs encrypted under `LOCAL_ARCHIVE_KEY` or a dedicated backup key
+- Noise provides transport confidentiality; the blob provides at-rest confidentiality
+- This is explicitly allowed because Noise is used for live transfer, not stored delivery
 
 **Message Schema Reuse**: Paykit defines plaintext schemas for each message kind. The same schema is:
 - Carried inside Noise frames (live transport), OR
 - Used as Sealed Blob plaintext payload (stored delivery)
 
-One encryption layer at a time. Never both.
+One encryption layer at a time for the stored delivery primitive. Backup transport is a separate concern.
 
 ---
 
@@ -108,6 +115,19 @@ One encryption layer at a time. Never both.
 | Symmetric encryption (transport) | ChaCha20-Poly1305 | `chacha20poly1305` via `snow` |
 | Symmetric encryption (envelopes) | XChaCha20-Poly1305 | `chacha20poly1305` crate |
 | Hashing | BLAKE2s (Noise), BLAKE3 (tags), SHA-256 (HKDF) | Various |
+
+**Primitive Selection Rationale (Mobile-Optimized)**:
+
+| Choice | Rationale |
+|--------|-----------|
+| **XChaCha20-Poly1305** for stored delivery | Random nonce safety: 192-bit nonce space eliminates collision risk for independent message encryption. Critical for mobile where counter state is hard to persist reliably. |
+| **ChaCha20-Poly1305** for live transport | Noise protocol standard. Counter nonces managed by library, no random generation needed per frame. |
+| **BLAKE3** for fingerprints/tags | Performance-optimized for non-RFC contexts. Faster than SHA-256 on mobile ARM. |
+| **BLAKE2s** in Noise patterns | Fixed by Noise protocol specification (e.g., `Noise_XX_25519_ChaChaPoly_BLAKE2s`). |
+| **Ed25519** for identity | Widely deployed, deterministic signatures, constant-time implementations available. |
+| **X25519** for key exchange | Fast, constant-time, compatible with Ed25519 keys via birational map. |
+
+These primitives prioritize: correctness without state (random nonces), mobile ARM performance, and interoperability with existing Noise implementations.
 
 ### 2.2 Key Sizes
 
@@ -313,7 +333,7 @@ This section defines the recommended FFI surface for Ring integrations.
 #### 5.3.1 Core Functions
 
 ```rust
-// List all inbox public keys for an app
+// List all inbox public keys for an app (app builds kid -> key_version cache)
 fn list_inbox_pubkeys(app_id: &str) -> Vec<InboxKeyInfo>;
 
 struct InboxKeyInfo {
@@ -322,16 +342,57 @@ struct InboxKeyInfo {
     key_version: u32,
 }
 
-// Derive an inbox secret handle for decryption (O(1) lookup by kid)
-fn derive_inbox_handle_by_kid(app_id: &str, kid: &[u8; 16]) -> Option<EncryptedSkHandle>;
+// Derive an inbox secret handle by version (bounded by max_inbox_key_version)
+fn derive_inbox_handle(app_id: &str, key_version: u32) -> Result<EncryptedSkHandle, Error>;
 
 // Derive a transport secret handle for Noise
-fn derive_transport_handle(app_id: &str, device_id: &[u8; 16]) -> EncryptedSkHandle;
+fn derive_transport_handle(app_id: &str, device_id: &[u8; 16], key_version: u32) -> Result<EncryptedSkHandle, Error>;
+
+// Query current maximum versions (for bounds checking)
+fn get_max_inbox_key_version(app_id: &str) -> u32;
+fn get_max_transport_key_version(app_id: &str, device_id: &[u8; 16]) -> u32;
 ```
 
-**Key Lookup**: Ring maintains an internal mapping `{ kid -> secret_key }`. Apps provide the `kid` extracted from the envelope header; Ring returns the corresponding handle or `None` if unknown.
+#### 5.3.2 State Model (Bounded, Not Unbounded)
 
-#### 5.3.2 EncryptedSkHandle Semantics
+**Ring stores only counters, not mappings**:
+
+| State | Scope | Description |
+|-------|-------|-------------|
+| `max_inbox_key_version` | Per `(identity, app_id)` | Maximum valid inbox key version |
+| `max_transport_key_version` | Per `(identity, app_id, device_id)` | Maximum valid transport key version |
+
+**App responsibility**: The **app** caches `{ kid -> key_version }` locally. This mapping is:
+- Non-secret (derived from public keys)
+- Bounded by `max_key_version`
+- Built from `list_inbox_pubkeys()` results
+
+**Why this design**:
+
+The previous design ("Ring maintains `{ kid -> secret_key }`") implied unbounded state growth and a trivial DoS vector: an attacker could send envelopes with arbitrary `kid` values, forcing Ring to attempt derivations or store failed lookups. The bounded version design:
+- Limits Ring state to small counters
+- Makes the attack surface explicit
+- Moves the (safe, non-secret) kid lookup to the app layer
+
+#### 5.3.3 Derivation Constraints
+
+Ring MUST enforce:
+
+| Constraint | Description |
+|------------|-------------|
+| Version bounds | `key_version <= max_version` for the requested scope |
+| Rate limiting | Derivation calls per app MUST be rate-limited to mitigate compromised-app brute force |
+| Monotonic versions | `max_version` only increments, never decrements |
+
+Apps MUST:
+
+| Rule | Description |
+|------|-------------|
+| Use discovered versions | Only request versions discovered via `list_inbox_pubkeys()` |
+| Handle `KeyNotFound` | If `kid` not in local cache, return error (do not guess versions) |
+| Bound cache size | Limit cached entries to `max_version + grace_period_versions` |
+
+#### 5.3.4 EncryptedSkHandle Semantics
 
 `EncryptedSkHandle` is an **opaque reference** to secret material. It can be:
 
@@ -347,7 +408,7 @@ fn derive_transport_handle(app_id: &str, device_id: &[u8; 16]) -> EncryptedSkHan
   - Zeroized immediately after use
   - Not stored or logged
 
-#### 5.3.3 FFI Safety Rules
+#### 5.3.5 FFI Safety Rules
 
 | Rule | Description |
 |------|-------------|
@@ -359,10 +420,22 @@ fn derive_transport_handle(app_id: &str, device_id: &[u8; 16]) -> EncryptedSkHan
 **Example Usage (Conceptual)**:
 
 ```rust
-// App wants to decrypt a Sealed Blob
+// App startup: build kid -> key_version cache from Ring
+let inbox_keys = ring.list_inbox_pubkeys("bitkit");
+let kid_cache: HashMap<[u8; 16], u32> = inbox_keys
+    .iter()
+    .map(|k| (k.kid, k.key_version))
+    .collect();
+
+// App receives a Sealed Blob envelope
 let kid = extract_kid_from_envelope(&envelope);  // 16 bytes from header key 3
-let handle = ring.derive_inbox_handle_by_kid("bitkit", &kid)
+
+// App looks up key_version (non-secret, local cache)
+let key_version = kid_cache.get(&kid)
     .ok_or(Error::KeyNotFound)?;
+
+// App calls Ring with bounded version (not arbitrary kid)
+let handle = ring.derive_inbox_handle("bitkit", *key_version)?;
 let plaintext = ring.decrypt_sealed_blob(&envelope, handle);
 // handle is invalidated after use
 ```
@@ -397,15 +470,19 @@ During handshake, each party sends an `IdentityPayload`:
 
 ```rust
 struct IdentityPayload {
-    ed25519_pub: [u8; 32],      // PKARR identity
-    noise_x25519_pub: [u8; 32], // Noise static for this session
-    epoch: u32,                  // Key epoch (internal, always 0 for now)
-    role: Role,                  // Client or Server
-    server_hint: Option<String>, // Routing hint
-    expires_at: Option<u64>,     // Unix seconds
-    sig: [u8; 64],               // Ed25519 signature over binding message
+    peerid: [u8; 32],              // Ed25519 identity (PKARR public key)
+    role: Role,                     // Client or Server
+    server_hint: Option<String>,    // Routing hint (optional)
+    hint_expires_at: Option<u64>,   // TTL for server_hint only (optional)
+    sig: [u8; 64],                  // Ed25519 signature over binding message
 }
 ```
+
+**Design Rationale**:
+
+- **No `epoch`**: Epoch is Ring-internal derivation metadata. Including it in the wire format would leak timing correlation and internal state. Epoch MUST NOT appear in signed payloads.
+- **No `noise_x25519_pub`**: The Noise static keys are already carried by the Noise handshake itself (XX/IK patterns). Duplicating them in IdentityPayload adds wire bytes and creates mismatch ambiguity.
+- **`hint_expires_at`**: Scoped exclusively to `server_hint` routing metadata. Does NOT affect key validity or session lifetime.
 
 ### 6.4 Binding Message
 
@@ -414,17 +491,29 @@ binding = BLAKE2s(
   "pubky-noise-bind:v1" ||
   pattern_tag ||
   prologue ||
-  ed25519_pub ||
+  peerid ||
   local_noise_pub ||
   remote_noise_pub? ||
-  epoch_le32 ||
   role_string ||
   server_hint? ||
-  expires_at?
+  hint_expires_at?
 )
 
 sig = Ed25519_Sign(ed25519_sk, binding)
 ```
+
+**Field Sources**:
+
+| Field | Source |
+|-------|--------|
+| `peerid` | From IdentityPayload |
+| `local_noise_pub` | Extracted from Noise handshake messages (not from payload) |
+| `remote_noise_pub` | Extracted from Noise handshake messages (available after step 2) |
+| `role_string` | `"client"` or `"server"` |
+| `server_hint` | From IdentityPayload (optional) |
+| `hint_expires_at` | From IdentityPayload (optional, little-endian u64 if present) |
+
+**Note**: `epoch` is explicitly excluded from the binding transcript. Key derivation epoch is Ring-internal state and MUST NOT be exposed on the wire.
 
 ### 6.5 Session Identifier
 
@@ -464,11 +553,11 @@ A KeyBinding object binds X25519 keys to a PeerId. It is published via PKARR DNS
 
 ```rust
 struct KeyBinding {
-    peerid: [u8; 32],              // Ed25519 identity (PeerId)
+    peerid: [u8; 32],                // Ed25519 identity (PeerId)
     inbox_keys: Vec<InboxKeyEntry>,  // For Sealed Blob encryption
     transport_keys: Vec<TransportKeyEntry>, // For Noise sessions (optional)
-    created_at: u64,               // Unix timestamp
-    signature: [u8; 64],           // Ed25519 signature by peerid
+    published_at: Option<u64>,       // OPTIONAL: coarse timestamp (day granularity preferred)
+    signature: [u8; 64],             // Ed25519 signature by peerid
 }
 
 struct InboxKeyEntry {
@@ -485,6 +574,14 @@ struct TransportKeyEntry {
 
 **Signature Scope**: The signature covers the canonical serialization of all fields except `signature` itself.
 
+**Timestamp Privacy**:
+
+- `published_at` is **OPTIONAL** and **default off** for publication
+- Fine-grained timestamps leak key creation timing and correlate communication windows
+- Use `key_version` as the primary ordering mechanism
+- If staleness heuristic is needed, use PKARR record TTL/update metadata or coarse-grained day granularity
+- Implementations SHOULD NOT publish fine-grained timestamps by default
+
 #### 6.8.2 Pinning Rules (Normative)
 
 | Condition | Required Pattern | Rationale |
@@ -493,12 +590,26 @@ struct TransportKeyEntry {
 | Verified KeyBinding exists | MAY use IK | Initiator can encrypt static to known responder key |
 | KeyBinding expired or revoked | MUST use XX | Treat as unknown |
 
-**Upgrade to IK**:
+**MVP Policy (Normative)**:
+
+For MVP, implementations MUST follow these conservative defaults:
+
+| Rule | Description |
+|------|-------------|
+| XX by default | Use Noise_XX for all arbitrary/unknown peers |
+| No automatic IK promotion | MUST NOT automatically upgrade XX -> IK for arbitrary peers |
+| Explicit opt-in only | IK allowed only for: (1) explicit service peers, or (2) peers with verified KeyBinding AND explicit user/app policy acceptance |
+| Rate limiting | Any IK promotion MUST be rate-limited to prevent sybil injection |
+
+**Rationale**: Automatic XX -> IK upgrade can be abused for resource exhaustion (forcing implementations to store many pinned keys) and sybil injection (attacker creates many peer identities). MVP restricts IK to controlled scenarios.
+
+**Upgrade to IK** (when explicitly allowed):
 
 Implementations MUST NOT upgrade to IK until:
 1. A KeyBinding for the target PeerId has been fetched and verified
 2. The TransportKey in the KeyBinding has been pinned locally
 3. The PeerId has been associated with the pinned TransportKey
+4. The upgrade has been explicitly approved by user action or allowlisted policy
 
 **Pin Storage**:
 
@@ -525,9 +636,24 @@ The XX pattern authenticates both parties to each other during the handshake, bu
 
 ## 7. Async Messaging (Async Envelopes)
 
-### 7.1 Purpose
+### 7.1 Purpose and Layering
 
 When both parties are not online simultaneously, messages are stored encrypted on the homeserver. The recipient decrypts without the sender being online.
+
+**Explicit Layering Rules**:
+
+| Rule | Description |
+|------|-------------|
+| Sealed Blob = stored delivery | Sealed Blob envelopes are written to homeserver storage and fetched by the recipient |
+| Noise = live transport | Noise transport frames are NEVER written to homeserver for later decryption |
+| No Noise storage | Queuing Noise ciphertext for offline delivery is PROHIBITED |
+| Backup transport allowed | Apps may send already-encrypted backup blobs over live Noise channels (see Section 1.4) |
+
+**Envelope vs Transport**:
+
+- "Envelope" in this spec means a Sealed Blob stored on the homeserver for async retrieval
+- "Transport" means a live Noise channel for real-time bidirectional communication
+- These are distinct primitives with different security properties and use cases
 
 ### 7.2 Sealed Blob v2 Wire Format
 
@@ -733,18 +859,19 @@ sig = Ed25519_Sign(
 
 ### 7.7 ContextId Definition
 
-ContextId provides a stable, symmetric identifier for a peer pair, used in storage paths for routing and correlation.
+ContextId is an **application-chosen** thread identifier used in storage paths for routing and correlation.
 
-**Derivation (Normative)**:
+#### 7.7.1 ContextId (Normative for Paykit)
 
-```
-context_id = SHA256("paykit:v0:context:" || first_z32 || ":" || second_z32)
-```
+For Paykit threads, ContextId:
 
-Where:
-- `first_z32` and `second_z32` are normalized z-base-32 pubkeys sorted lexicographically
-- **Result is 32 raw bytes** (the SHA-256 output, not hex-encoded)
-- Symmetric: same value regardless of which party computes it
+| Requirement | Description |
+|-------------|-------------|
+| Format | 32 random bytes (or 16 if constrained) |
+| Generation | Random per thread, generated by the thread initiator |
+| Lifetime | Stable for the lifetime of that thread |
+| Uniqueness | MUST be unique per thread |
+| Derivation | MUST NOT be derived from peer pubkeys |
 
 **Canonical Form**: The canonical `context_id` is always **32 raw bytes**. All cryptographic operations (AAD computation, CBOR serialization, header encoding) use the raw bytes.
 
@@ -756,6 +883,30 @@ Where:
 | `context_id_z32` | `z-base-32(context_id)` (52 chars) | Storage paths (preferred) |
 
 **Implementation Rule**: When decoding `context_id` from JSON or display format, implementations MUST decode to 32 raw bytes before computing AAD or performing any cryptographic operation.
+
+#### 7.7.2 PairContextId (Optional, Diagnostic Only)
+
+For diagnostics and correlation across threads, implementations MAY compute a deterministic peer-pair identifier:
+
+```
+pair_context_id = SHA256("paykit:v0:pair-context:" || first_z32 || ":" || second_z32)
+```
+
+Where:
+- `first_z32` and `second_z32` are normalized z-base-32 pubkeys sorted lexicographically
+- Result is 32 raw bytes
+- Symmetric: same value regardless of which party computes it
+
+**Usage Restrictions**:
+
+| Rule | Description |
+|------|-------------|
+| NOT for thread identity | PairContextId MUST NOT be used as the primary thread identifier |
+| NOT in storage paths | Use random ContextId in storage paths, not PairContextId |
+| Diagnostics only | PairContextId is for logging, debugging, and cross-thread correlation |
+| Unlinkability | Random ContextId per thread provides unlinkability; PairContextId defeats this |
+
+**Note**: For out-of-band stable peer verification, use `PeerPairFingerprint` (Section 8.5) instead of PairContextId.
 
 **z-base-32 Normalization rules** (for input pubkeys):
 1. Trim whitespace
@@ -1031,13 +1182,23 @@ For async envelopes:
 - **Not trusted by default**: Sender identity is only *proven* if `sig` (key 10) verifies for `sender_peerid`
 - Without a valid signature, treat `sender_peerid` as routing metadata only
 
-### 8.4 ContextId vs SessionId
+### 8.4 ContextId vs SessionId vs PairContextId
 
-- **SessionId**: Derived from Noise handshake transcript hash. Changes on every new handshake. Only available after handshake completes. Used for live session binding.
+| Identifier | Generation | Stability | Purpose |
+|------------|------------|-----------|---------|
+| **SessionId** | Derived from Noise handshake transcript hash | Changes every handshake | Live session binding |
+| **ContextId** | Random per thread (app-chosen) | Stable for thread lifetime | Storage paths, ACK routing |
+| **PairContextId** | Derived from peer pubkey pair | Stable across all threads | Diagnostics only (optional) |
 
-- **ContextId**: Derived from peer pubkey pair (Section 7.7). Stable across handshakes. Used for storage path routing, app-level correlation, and ACK bookkeeping.
+**Key Distinctions**:
 
-**Important**: ContextId MUST NOT be used to resume half-complete Noise handshakes. Noise provides no built-in handshake resume; ContextId is strictly for app-layer routing and correlation.
+- **SessionId**: Only available after handshake completes. Used for live transport binding. Changes on every new handshake, even between the same parties.
+
+- **ContextId**: Application-chosen (typically random). Used for storage path routing and ACK bookkeeping. Each thread gets its own ContextId, providing unlinkability between threads.
+
+- **PairContextId**: Deterministic per peer pair (Section 7.7.2). For diagnostics and cross-thread correlation only. MUST NOT be used in storage paths or as primary thread identifier.
+
+**Important**: Neither ContextId nor PairContextId may be used to resume half-complete Noise handshakes. Noise provides no built-in handshake resume; these identifiers are strictly for app-layer routing and correlation.
 
 ### 8.5 PeerPairFingerprint
 
@@ -1237,7 +1398,8 @@ Test vectors for interoperability testing are defined in `pubky-noise/tests/`.
 | Envelope AAD prefix | `"pubky-envelope/v2:"` |
 | Envelope signature prefix | `"pubky-envelope-sig/v2"` |
 | PeerPairFingerprint prefix | `"pubky-peerpair/v1"` |
-| ContextId prefix | `"paykit:v0:context:"` |
+| ContextId prefix (legacy) | `"paykit:v0:context:"` |
+| PairContextId prefix | `"paykit:v0:pair-context:"` |
 | Paykit AAD prefix (legacy) | `"paykit:v0:"` |
 
 ---
@@ -1292,20 +1454,22 @@ This section documents gaps between the spec and current implementation.
 | Secure handoff (Ring → Bitkit) | ✅ Implemented | `pubky-ring/src/utils/actions/paykitConnectAction.ts` |
 | Domain separation (single X25519 key) | ✅ Specified | Section 4.7 |
 
-### C.2 Specified in v2.3 (Pending Implementation)
+### C.2 Specified in v2.4 (Pending Implementation)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ContextId derivation | 📋 Specified | Section 7.7; requires `paykit-lib` implementation |
+| ContextId app-chosen (random per thread) | 📋 Specified | Section 7.7; replaces peer-pair derivation |
+| PairContextId for diagnostics | 📋 Specified | Section 7.7.2; optional, for correlation only |
 | Header-bytes AAD construction | 📋 Specified | Section 7.5; replaces legacy string AAD |
 | Encrypted ACK protocol with status | 📋 Specified | Section 7.9; ACKs now have own `msg_id` and `status` |
 | PeerPairFingerprint | 📋 Specified | Section 8.5; BLAKE3-based, frozen |
-| KeyBinding and pinning rules | 📋 Specified | Section 6.8; XX-to-IK upgrade rules |
+| KeyBinding with optional timestamps | 📋 Specified | Section 6.8.1; `published_at` optional, default off |
+| MVP Policy (XX only by default) | 📋 Specified | Section 6.8.2; no automatic IK promotion |
 | Resend defaults | 📋 Specified | Section 7.13; 1m/2m/4m/8m/16m schedule |
-| Ring FFI interface | 📋 Specified | Section 5.3; EncryptedSkHandle semantics |
+| Ring FFI bounded version counters | 📋 Specified | Section 5.3; `derive_inbox_handle(app_id, key_version)` |
 | Canonical encoding (CBOR headers) | 📋 Specified | Section 7.12; deterministic CBOR per RFC 8949 |
 | kid 16-byte derivation | 📋 Specified | Section 7.2; `first_16_bytes(SHA256(pk))` |
-| Double encryption prohibition | 📋 Specified | Section 1.4; live vs stored delivery |
+| Backup transport allowance | 📋 Specified | Section 1.4; Noise may carry encrypted backup blobs |
 
 ### C.3 Not Yet Implemented
 
@@ -1314,11 +1478,23 @@ This section documents gaps between the spec and current implementation.
 | APP_SEED derivation layer | ❌ Not implemented | Currently uses ed25519 seed directly |
 | Role parameter in X25519 derivation | ❌ Not implemented | Info is `device_id \|\| epoch` only |
 | LOCAL_ARCHIVE_KEY derivation | ❌ Not implemented | Needs new function in kdf.rs |
-| kid-based key selection (16 bytes) | ❌ Not implemented | Uses single epoch; keyring lookup needed |
+| Version-based key selection | ❌ Not implemented | App caches `{kid -> key_version}`; Ring derives by version |
 | Binary wire format for Sealed Blob | ❌ Not implemented | JSON format still in use |
 | Deterministic CBOR headers | ❌ Not implemented | Requires header serialization update |
 | PeerPairFingerprint computation | ❌ Not implemented | Needs BLAKE3 integration |
 | KeyBinding via PKARR | ❌ Not implemented | Requires PKARR metadata extension |
+| IdentityPayload without epoch | ❌ Not implemented | Current impl includes epoch; needs removal |
+| Ring FFI rate limiting | ❌ Not implemented | Derivation calls need rate limits |
+
+### C.4 Breaking Changes in v2.4
+
+| Change | Migration |
+|--------|-----------|
+| IdentityPayload removes `epoch` and `noise_x25519_pub` | Update `identity_payload.rs`; noise keys from handshake |
+| `expires_at` renamed to `hint_expires_at` | Scope to `server_hint` only |
+| ContextId now app-chosen (random) | Generate random 32-byte IDs per thread |
+| Ring FFI uses `key_version` not `kid` | App caches `{kid -> key_version}` mapping |
+| KeyBinding `created_at` → `published_at` (optional) | Default off; use `key_version` for ordering |
 
 ---
 
