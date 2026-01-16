@@ -38,6 +38,12 @@ This specification defines the cryptographic primitives, key derivation schemes,
 11. [Security Considerations](#11-security-considerations)
 12. [Implementation Reference](#12-implementation-reference)
 
+**Appendices**:
+- [Appendix A: Domain Separation Strings](#appendix-a-domain-separation-strings)
+- [Appendix B: Encoding Reference](#appendix-b-encoding-reference)
+- [Appendix C: Comparison with Current Implementation](#appendix-c-comparison-with-current-implementation)
+- [Appendix D: Specification Organization](#appendix-d-specification-organization)
+
 ---
 
 ## 1. Design Principles
@@ -266,13 +272,11 @@ NOISE_STATIC_PK = X25519_BASEPOINT_MULT(NOISE_STATIC_SK)
 - `epoch`: 32-bit little-endian integer, starts at 0
 - `role`: ASCII string (e.g., `"transport"`, `"handoff"`) — **optional, for future domain separation**
 
-**Epoch Encoding Decision Point (Team Decision Required)**:
+**Epoch Encoding (Normative)**:
 
-- **Option A (Freeze)**: Epoch MUST be encoded as 32-bit little-endian bytes in all derivation contexts. This encoding is normative and MUST be consistent across all implementations regardless of implementation language.
+Epoch MUST be encoded as 32-bit little-endian bytes when used in key derivation. This encoding is normative and MUST be consistent across all implementations.
 
-- **Option B (Remove)**: Remove epoch from all cross-device derivation. Use key_version only. Epoch was Ring-internal and should not appear in any derivation info accessible to apps.
-
-**Recommendation**: Option B for simplicity.
+**Important**: Epoch is Ring-internal derivation state. Applications SHOULD use `key_version` for key management instead of exposing raw epoch values. Epoch MUST NOT appear in any wire format or cross-device protocol message.
 
 **Current implementation note**: The `role` parameter is not yet implemented. Current derivation uses `device_id || epoch` only.
 
@@ -623,7 +627,7 @@ struct IdentityPayload {
 - **No `noise_x25519_pub`**: The Noise static keys are already carried by the Noise handshake itself (XX/IK patterns). Duplicating them in IdentityPayload adds wire bytes and creates mismatch ambiguity.
 - **`hint_expires_at`**: Scoped exclusively to `server_hint` routing metadata. Does NOT affect key validity or session lifetime.
 
-**role Field**: The Noise state machine knows which side it is. The `role` field exists for application-layer disambiguation when needed (e.g., logging, debugging). It is not cryptographically significant.
+**role Field**: The Noise state machine knows which side it is. The `role` field in IdentityPayload exists for application-layer disambiguation (e.g., logging, debugging). While the field itself is not independently verified, `role` IS cryptographically significant because it is included in the binding message signature (Section 6.4). This provides domain separation: a client's signature cannot be replayed as a server's signature, even with identical keys.
 
 **server_hint (Non-Normative Metadata)**:
 
