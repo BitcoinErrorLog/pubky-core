@@ -13,6 +13,7 @@ This specification defines the cryptographic primitives, key derivation schemes,
 1. [Design Principles](#1-design-principles)
    - 1.3 [Required Properties](#13-required-properties)
    - 1.4 [Live Transport vs Stored Delivery](#14-live-transport-vs-stored-delivery)
+   - 1.5 [Relationship to Noise Protocol](#15-relationship-to-noise-protocol)
 2. [Cryptographic Primitives](#2-cryptographic-primitives)
 3. [Identity Model](#3-identity-model)
 4. [Key Hierarchy and Derivation](#4-key-hierarchy-and-derivation)
@@ -341,11 +342,6 @@ kid = first_16_bytes(SHA256(x25519_pub))
 
 This `kid` is included in Sealed Blob v2 headers (Section 7.2) to enable efficient key lookup.
 
-**Future migration path**: If stronger isolation is required, split into:
-- `InboxKey`: X25519 for Sealed Blob envelopes only
-- `TransportKey`: X25519 for Noise sessions only
-
-Both keys can be published in PKARR metadata (with their respective `kid` values) without breaking identity.
 
 ### 4.8 InboxKey vs TransportKey Separation
 
@@ -531,7 +527,7 @@ Apps MUST:
 
 **DummyRing Warning**: The `DummyRing` implementation in pubky-noise is for **testing only**. Production deployments MUST use platform keychain/keystore integration.
 
-#### 5.3.5 FFI Safety Rules
+### 5.5 FFI Safety Rules
 
 | Rule | Description |
 |------|-------------|
@@ -675,25 +671,6 @@ Where:
 
 **Note**: `epoch` is explicitly excluded from the binding transcript. Key derivation epoch is Ring-internal state and MUST NOT be exposed on the wire.
 
-**Legacy Format (Deprecated)**:
-
-The previous binding format using BLAKE2s and additional fields is deprecated:
-
-```
-binding = BLAKE2s(
-  "pubky-noise-bind:v1" ||
-  pattern_tag ||
-  prologue ||
-  peerid ||
-  local_noise_pub ||
-  remote_noise_pub? ||
-  role_string ||
-  server_hint? ||
-  hint_expires_at?
-)
-```
-
-New implementations MUST use the BLAKE3 format above.
 
 ### 6.5 Session Identifier
 
@@ -714,21 +691,6 @@ Post-handshake messages use the Noise transport mode with ChaCha20-Poly1305. The
 **Transport Nonce Handling (Normative)**:
 
 Noise uses a 64-bit little-endian counter as the nonce, encoded into a 96-bit (12-byte) nonce as per the Noise specification. The `snow` library manages this counter internally. Implementations **MUST NOT** manually manage Noise nonces. Attempting to set or export nonces breaks the security model.
-
-### 6.9 Protocol Symmetry Considerations
-
-**Current Architecture**: pubky-noise uses client-server model (`client.rs`, `server.rs`). One peer initiates (client), one responds (server).
-
-**Implication for P2P**: Two peers must decide out-of-band who initiates. For stored delivery, this is less relevant (either can write to their inbox, other polls).
-
-**pubky-data Approach**: Fully symmetric `PubkyDataEncryptor`. Either peer can encrypt/decrypt without role assignment.
-
-**Decision Point for Implementation**:
-
-- **Option A**: Keep client-server architecture. Define convention for role selection (e.g., lexicographically smaller PeerId initiates).
-- **Option B**: Refactor pubky-noise toward symmetric peer API. Either side can initiate, both poll inbox.
-
-This decision should be made before significant new development on pubky-noise.
 
 ### 6.7 No State Persistence
 
@@ -856,6 +818,21 @@ The XX pattern authenticates both parties to each other during the handshake, bu
 
 **Prevention**: Once IK pattern is used with a pinned key, active MITM requires key compromise.
 
+### 6.9 Protocol Symmetry Considerations
+
+**Current Architecture**: pubky-noise uses client-server model (`client.rs`, `server.rs`). One peer initiates (client), one responds (server).
+
+**Implication for P2P**: Two peers must decide out-of-band who initiates. For stored delivery, this is less relevant (either can write to their inbox, other polls).
+
+**pubky-data Approach**: Fully symmetric `PubkyDataEncryptor`. Either peer can encrypt/decrypt without role assignment.
+
+**Decision Point for Implementation**:
+
+- **Option A**: Keep client-server architecture. Define convention for role selection (e.g., lexicographically smaller PeerId initiates).
+- **Option B**: Refactor pubky-noise toward symmetric peer API. Either side can initiate, both poll inbox.
+
+This decision should be made before significant new development on pubky-noise.
+
 ---
 
 ## 7. Async Messaging (Async Envelopes)
@@ -972,24 +949,6 @@ Where:
 
 **Trust Rule**: Without a valid signature, treat `sender_peerid` as routing metadata only, not proven identity. For Paykit purposes (request, proposal, ack), missing or invalid `sig` MUST cause message rejection.
 
-**Legacy JSON Format (Deprecated)**:
-
-For backward compatibility with existing implementations, the JSON format is still accepted:
-
-```json
-{
-  "v": 2,
-  "epk": "<base64url: sender ephemeral X25519 public key, 32 bytes>",
-  "sender": "<z-base-32: sender PKARR public key>",
-  "nonce": "<base64url: 24 bytes>",
-  "ct": "<base64url: ciphertext + 16-byte tag>",
-  "kid": "<hex: 16 bytes>",
-  "purpose": "<string: hint only>",
-  "sig": "<base64url: 64 bytes, optional>"
-}
-```
-
-New implementations SHOULD use the binary wire format. The `kid` field MUST be 16 bytes in both formats.
 
 ### 7.3 Key Derivation (Envelopes)
 
@@ -1097,38 +1056,6 @@ This AAD construction is **complementary to** (not replacing) Noise's transport 
 
 They serve different purposes and are not redundant.
 
-**Legacy Paykit AAD Format (Deprecated)**:
-
-For backward compatibility with existing implementations:
-
-```
-aad = "paykit:v0:" || purpose || ":" || owner_z32 || ":" || path || ":" || id
-```
-
-Where:
-- `purpose`: Object type (`request`, `subscription_proposal`, `ack_request`, `ack_subscription_proposal`, `handoff`)
-- `owner_z32`: Normalized z-base-32 pubkey of the storage owner
-- `path`: Full storage path (e.g., `/pub/paykit.app/v0/requests/{context_id}/{id}`)
-- `id`: Object identifier (request_id, proposal_id, msg_id)
-
-**Migration**: New implementations MUST use the header_bytes AAD format. Legacy format is accepted for decryption only during migration period.
-
-**Examples (Legacy Format)**:
-
-Payment request (sender writes to their storage):
-```
-paykit:v0:request:8um71us...xyz:/pub/paykit.app/v0/requests/abcd1234.../req_001:req_001
-```
-
-Encrypted ACK (recipient writes to their storage):
-```
-paykit:v0:ack_request:tj1igr...abc:/pub/paykit.app/v0/acks/request/abcd1234.../req_001:req_001
-```
-
-Secure handoff (Ring user writes to their storage):
-```
-paykit:v0:handoff:8um71us...xyz:/pub/paykit.app/v0/handoff/abc123:abc123
-```
 
 ### 7.6 Sender Signature and Identity
 
@@ -1142,36 +1069,21 @@ The `sender_peerid` (header key 9) is the **PKARR Ed25519 public key** of the se
 
 **Signature Input (v2 wire format)**:
 
+See Section 7.2.1 for the authoritative signature construction. Summary:
+
 ```
-header_bytes_without_sig = CBOR_encode(header_map excluding key 10)
-sig_input = BLAKE3("pubky-envelope-sig/v2" || header_bytes_without_sig || ciphertext_bytes)
-sig = Ed25519_Sign(sender_ed25519_sk, sig_input)
+header_no_sig = CBOR_encode(header_map with key 10 omitted)
+aad = aad_prefix || owner_peerid_bytes || canonical_path_bytes || header_no_sig
+sig_input = BLAKE3("pubky-envelope-sig/v2" || aad || header_no_sig || ciphertext)
+sig = Ed25519_Sign(sender_peerid_sk, sig_input)
 ```
 
-Where:
-- `header_bytes_without_sig`: Deterministic CBOR encoding of the header map with key 10 (`sig`) omitted
-- `ciphertext_bytes`: The raw ciphertext (after the header in the wire format)
-- `sig`: 64-byte Ed25519 signature, stored in header key 10
+**Note**: The `aad` is included in `sig_input` to bind the signature to the storage context, preventing envelope relocation attacks.
 
-**Verification**:
-
-1. Extract `sig` (key 10) from the header
-2. Re-encode the header without key 10 to produce `header_bytes_without_sig`
-3. Compute `sig_input = BLAKE3("pubky-envelope-sig/v2" || header_bytes_without_sig || ciphertext_bytes)`
-4. Verify `sig` against `sender_peerid` (key 9) using Ed25519
+**Verification**: See Section 7.2.1 for detailed verification steps.
 
 **Trust Rule**: The `sender_peerid` field is authenticated via AAD (tamper-evident), but the sender identity is **trusted** only if `sig` verifies. Without a valid signature, treat `sender_peerid` as routing metadata, not proven identity. For Paykit purposes (request, proposal, ack), missing or invalid `sig` MUST cause message rejection.
 
-**Legacy JSON Format**:
-
-For backward compatibility with JSON envelopes:
-
-```
-sig = Ed25519_Sign(
-  sender_ed25519_sk,
-  BLAKE3("pubky-envelope-sig/v2" || v || epk || sender || nonce || ct)
-)
-```
 
 ### 7.7 Terminology and ContextId Definition
 
@@ -1470,7 +1382,7 @@ Canonical path bytes for AAD construction:
 pub/paykit.app/v0/requests/abc123/req_001     (no leading slash)
 ```
 
-#### 7.12.3 Header Serialization (Deterministic CBOR)
+#### 7.12.6 Header Serialization (Deterministic CBOR)
 
 Sealed Blob v2 headers use **Deterministic CBOR** per RFC 8949:
 
@@ -1693,13 +1605,6 @@ When decrypting envelopes, use the `kid` field (header key 3) for key selection:
 - Look up `kid` in local keyring: `{ kid -> X25519_sk }`
 - If no match, return `KeyNotFound`
 
-**v1 Envelopes (legacy JSON format)**:
-
-- `kid` is optional (8 bytes if present)
-- If `kid` present: look up in keyring
-- If `kid` absent: try current epoch key only
-- If decryption fails, return `DecryptionFailed`
-
 **Keyring maintenance**:
 - Maintain mapping `{ kid -> sk }` for current and N previous epochs
 - Retain old keys for ACK TTL period (default 7 days)
@@ -1819,14 +1724,12 @@ Test vectors for interoperability testing are defined in `pubky-noise/tests/`.
 | Noise seed salt | `"pubky-ring/noise-seed/v1"` |
 | X25519 derivation salt | `"pubky-noise-x25519:v1"` |
 | Local archive salt | `"pubky-ring/local-archive/v1"` |
-| Identity binding prefix | `"pubky-noise-bind:v1"` |
+| Identity binding prefix | `"pubky-noise-binding/v1"` |
 | Envelope key info | `"pubky-envelope/v2"` |
 | Envelope AAD prefix | `"pubky-envelope/v2:"` |
 | Envelope signature prefix | `"pubky-envelope-sig/v2"` |
-| PeerPairFingerprint prefix | `"pubky-peerpair/v1"` |
-| ContextId prefix (legacy) | `"paykit:v0:context:"` |
+| PeerPairFingerprint prefix | `"pubky-fingerprint/v1:"` |
 | PairContextId prefix | `"paykit:v0:pair-context:"` |
-| Paykit AAD prefix (legacy) | `"paykit:v0:"` |
 
 ---
 
@@ -1842,16 +1745,7 @@ Test vectors for interoperability testing are defined in `pubky-noise/tests/`.
 | Header | Deterministic CBOR (RFC 8949) with integer keys |
 | Ciphertext | Raw bytes (XChaCha20-Poly1305 output) |
 
-### B.2 Legacy JSON Format (Deprecated)
-
-| Data | Encoding |
-|------|----------|
-| Keys in JSON envelopes | base64url (no padding) |
-| `kid` in JSON | hex (16 bytes) |
-
-JSON format is accepted for backward compatibility only. New implementations SHOULD use the binary wire format.
-
-### B.3 General Encodings
+### B.2 General Encodings
 
 | Data | Encoding |
 |------|----------|
@@ -1880,13 +1774,13 @@ This section documents gaps between the spec and current implementation.
 | Secure handoff (Ring → Bitkit) | ✅ Implemented | `pubky-ring/src/utils/actions/paykitConnectAction.ts` |
 | Domain separation (single X25519 key) | ✅ Specified | Section 4.7 |
 
-### C.2 Specified in v2.4 (Pending Implementation)
+### C.2 Specified (Pending Implementation)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | ContextId app-chosen (random per thread) | 📋 Specified | Section 7.7; replaces peer-pair derivation |
 | PairContextId for diagnostics | 📋 Specified | Section 7.7.2; optional, for correlation only |
-| Header-bytes AAD construction | 📋 Specified | Section 7.5; replaces legacy string AAD |
+| Header-bytes AAD construction | 📋 Specified | Section 7.5 |
 | Encrypted ACK protocol with status | 📋 Specified | Section 7.9; ACKs now have own `msg_id` and `status` |
 | PeerPairFingerprint | 📋 Specified | Section 8.5; BLAKE3-based, frozen |
 | KeyBinding with optional timestamps | 📋 Specified | Section 6.8.1; `published_at` optional, default off |
@@ -1909,18 +1803,8 @@ This section documents gaps between the spec and current implementation.
 | Deterministic CBOR headers | ❌ Not implemented | Requires header serialization update |
 | PeerPairFingerprint computation | ❌ Not implemented | Needs BLAKE3 integration |
 | KeyBinding via PKARR | ❌ Not implemented | Requires PKARR metadata extension |
-| IdentityPayload without epoch | ❌ Not implemented | Current impl includes epoch; needs removal |
+| IdentityPayload without epoch | ✅ Implemented | `identity_payload.rs` updated Jan 2026 |
 | Ring FFI rate limiting | ❌ Not implemented | Derivation calls need rate limits |
-
-### C.4 Breaking Changes in v2.4
-
-| Change | Migration |
-|--------|-----------|
-| IdentityPayload removes `epoch` and `noise_x25519_pub` | Update `identity_payload.rs`; noise keys from handshake |
-| `expires_at` renamed to `hint_expires_at` | Scope to `server_hint` only |
-| ContextId now app-chosen (random) | Generate random 32-byte IDs per thread |
-| Ring FFI uses `key_version` not `kid` | App caches `{kid -> key_version}` mapping |
-| KeyBinding `created_at` → `published_at` (optional) | Default off; use `key_version` for ordering |
 
 ---
 
