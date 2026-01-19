@@ -6,6 +6,13 @@
 
 This specification defines the cryptographic primitives, key derivation schemes, transport protocols, and envelope formats used across the Pubky ecosystem (pubky-ring, pubky-noise, paykit, bitkit).
 
+### Related Specifications
+
+| Specification | Relationship |
+|---------------|--------------|
+| [PUBKY_UNIFIED_KEY_DELEGATION_SPEC](PUBKY_UNIFIED_KEY_DELEGATION_SPEC_v0.2.md) | Optional extension for delegated AppKey signing |
+| [Atomicity Specification](../../atomicity-research/Atomicity%20Specification.md) | Application spec that consumes these primitives for P2P credit |
+
 ---
 
 ## Table of Contents
@@ -314,38 +321,9 @@ LOCAL_ARCHIVE_KEY = HKDF-SHA256(
 
 This key encrypts local data only. MUST NOT be used for outbox envelopes.
 
-### 4.7 Domain Separation for Single X25519 Key (MVP)
+### 4.7 InboxKey vs TransportKey Separation (Normative)
 
-For MVP, devices publish a **single X25519 static public key** that serves both:
-- Live Noise transport sessions (Noise_XX, Noise_IK patterns)
-- Sealed Blob envelopes (async encrypted messages)
-
-This is safe due to **strict domain separation**:
-
-| Protocol | HKDF Info String | Nonce Size | AEAD |
-|----------|------------------|------------|------|
-| Noise Transport | (per Noise spec) | 12 bytes | ChaCha20-Poly1305 |
-| Sealed Blob v2 | `"pubky-envelope/v2"` | 24 bytes | XChaCha20-Poly1305 |
-
-**Security guarantees**:
-- Different HKDF info strings produce unrelated derived keys
-- Different nonce sizes prevent cross-protocol nonce reuse
-- AAD binds envelope ciphertext to storage context
-
-**kid Derivation**:
-
-For O(1) key selection, derive a 16-byte key identifier from any X25519 public key:
-
-```
-kid = first_16_bytes(SHA256(x25519_pub))
-```
-
-This `kid` is included in Sealed Blob v2 headers (Section 7.2) to enable efficient key lookup.
-
-
-### 4.8 InboxKey vs TransportKey Separation
-
-This section defines the key role separation for future versions and MVP constraints.
+This section defines the **normative key role separation** for all implementations.
 
 **InboxKey**:
 - X25519 key used ONLY for Sealed Blob stored delivery
@@ -355,23 +333,31 @@ This section defines the key role separation for future versions and MVP constra
 **TransportKey**:
 - X25519 key used ONLY for Noise static key in live transport
 - Used in XX and IK handshake patterns
-- May be published in PKARR for IK pattern
+- May be published in PKARR KeyBinding for IK pattern
 
-**Reuse Rule (MVP)**:
-- Reusing the same X25519 key for both InboxKey and TransportKey is **PROHIBITED in MVP**
-- Domain separation via HKDF info strings provides safety if reuse is ever allowed
-- Future versions MAY allow reuse with explicit configuration and domain separation labels
+**Separation Rule (Normative)**:
+- InboxKey and TransportKey MUST be distinct X25519 keys
+- Implementations MUST NOT use TransportKey for Sealed Blob encryption
+- Implementations MUST NOT use InboxKey for Noise handshakes
 
-**Rationale**: Separating keys limits blast radius of key compromise and simplifies key rotation.
+**Rationale**: Separating keys limits blast radius of key compromise, simplifies independent key rotation, and prevents cross-protocol security interactions.
 
 **Key Discovery**:
 
 | Key Type | Discovery Source |
 |----------|------------------|
 | InboxKey | PKARR KeyBinding `inbox_keys` list |
-| TransportKey | PKARR KeyBinding `transport_keys` list or `/pub/paykit.app/v0/noise` endpoint |
+| TransportKey | PKARR KeyBinding `transport_keys` list or `/pub/{app_id}/v0/noise` endpoint |
 
-Implementations MUST NOT use TransportKey for Sealed Blob encryption or InboxKey for Noise handshakes.
+**kid Derivation**:
+
+For O(1) key selection, derive a 16-byte key identifier from any X25519 public key:
+
+```
+kid = first_16_bytes(SHA256(x25519_pub))
+```
+
+This `kid` is included in Sealed Blob v2 headers (Section 7.2) to enable efficient key lookup. For InboxKey, this is referred to as `inbox_kid`. For TransportKey, this may be referred to as `transport_kid` when used for key selection hints.
 
 ---
 
@@ -505,6 +491,58 @@ Apps MUST:
   - Scoped to a single operation
   - Zeroized immediately after use
   - Not stored or logged
+
+#### 5.3.5 Typed Signing API (Normative)
+
+Ring MUST NOT expose a generic "sign arbitrary bytes" API. All signing operations MUST be typed and scoped to specific protocol transcripts.
+
+**Rationale**: A generic signing API allows attackers (via phishing, compromised apps, or malicious deep links) to trick users into signing arbitrary payloads. Typed signing ensures the signing key can only produce signatures for well-defined protocol objects.
+
+**RootKey Signing (via Ring)**:
+
+| Transcript Type | Purpose | Ring Validates |
+|-----------------|---------|----------------|
+| `keybinding/v1` | KeyBinding publication | `app_id`, `key_version` bounds |
+| `appcert/v1` | AppCert issuance | `app_id`, `capability_flags` |
+
+```rust
+// Sign a KeyBinding (Ring constructs the transcript)
+fn sign_keybinding(
+    app_id: &str,
+    inbox_keys: &[InboxKeyEntry],
+    transport_keys: &[TransportKeyEntry],
+    app_keys: Option<&[AppKeyEntry]>,
+) -> Result<SignedKeyBinding, Error>;
+
+// Sign an AppCert (Ring constructs the transcript)
+fn sign_appcert(
+    app_id: &str,
+    app_ed25519_pub: &[u8; 32],
+    capabilities: u32,
+    expires_at: Option<u64>,
+) -> Result<SignedAppCert, Error>;
+```
+
+**AppKey Signing (delegated)**:
+
+AppKey signing is performed by the app (not Ring) using the AppKey private key. Ring does NOT hold AppKey secrets; the app derives or stores AppKey material. However, Ring MAY provide:
+
+| Transcript Type | Purpose | Ring Validates |
+|-----------------|---------|----------------|
+| `sealed-blob-sig/v2` | Sealed Blob header signature | Header structure, `sender_peerid` matches identity |
+| `signed-content/v1` | SignedContent envelope | Content type, size bounds |
+| `dpop-proof/v1` | DPoP-like request proof | URL, method, timestamp bounds |
+
+Apps without AppCert fall back to RootKey signing via Ring (limited to the transcripts above).
+
+**Prohibited Patterns**:
+
+| Pattern | Why Prohibited |
+|---------|----------------|
+| `sign(arbitrary_bytes)` | Allows signature phishing |
+| `sign_message(user_visible_string)` | Used for "prove you own this key" but enables arbitrary signing |
+| `sign_challenge(challenge_bytes)` | Attacker controls challenge; can embed malicious content |
+
 
 ### 5.4 Platform Keychain Integration
 
@@ -710,30 +748,44 @@ This section defines how X25519 keys are bound to PeerIds and how implementation
 
 #### 6.8.1 KeyBinding Object
 
-A KeyBinding object binds X25519 keys to a PeerId. It is published via PKARR DNS records and can be cached locally.
+A KeyBinding object binds X25519 keys to a PeerId for a specific application. It is published via PKARR DNS records and can be cached locally.
 
-```rust
-struct KeyBinding {
-    peerid: [u8; 32],                // Ed25519 identity (PeerId)
-    inbox_keys: Vec<InboxKeyEntry>,  // For Sealed Blob encryption
-    transport_keys: Vec<TransportKeyEntry>, // For Noise sessions (optional)
-    published_at: Option<u64>,       // OPTIONAL: coarse timestamp (day granularity preferred)
-    signature: [u8; 64],             // Ed25519 signature by peerid
-}
+**Encoding (Normative)**: KeyBinding MUST use Deterministic CBOR (RFC 8949) for wire encoding:
+- Map keys MUST be unsigned integers (for compactness)
+- Keys sorted by numeric value
+- Definite length only
+- No floats
 
-struct InboxKeyEntry {
-    x25519_pub: [u8; 32],
-    kid: [u8; 16],
-    key_version: u32,
-}
+**Schema (CBOR map with integer keys)**:
 
-struct TransportKeyEntry {
-    x25519_pub: [u8; 32],
-    key_version: u32,
-}
-```
+| Key | Field | Type | Required | Description |
+|----:|-------|------|----------|-------------|
+| 0 | `peerid` | bytes(32) | REQUIRED | Ed25519 identity (PeerId) |
+| 1 | `app_id` | text | REQUIRED | Application identifier (e.g., `"paykit"`, `"atomicity"`, `"pubky.app"`) |
+| 2 | `inbox_keys` | array | REQUIRED | InboxKeyEntry list for Sealed Blob encryption |
+| 3 | `transport_keys` | array | OPTIONAL | TransportKeyEntry list for Noise sessions |
+| 4 | `app_keys` | array | OPTIONAL | AppKeyEntry list for delegated signing (see Section 6.8.5) |
+| 5 | `published_at` | uint | OPTIONAL | Coarse timestamp (day granularity preferred) |
+| 6 | `signature` | bytes(64) | REQUIRED | Ed25519 signature by peerid |
 
-**Signature Scope**: The signature covers the canonical serialization of all fields except `signature` itself.
+**InboxKeyEntry** (CBOR array or map):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x25519_pub` | bytes(32) | Inbox X25519 public key |
+| `kid` | bytes(16) | Key identifier: `first_16_bytes(SHA256(x25519_pub))` |
+| `key_version` | uint | Monotonically increasing version for rotation |
+
+**TransportKeyEntry** (CBOR array or map):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x25519_pub` | bytes(32) | Transport X25519 public key |
+| `key_version` | uint | Monotonically increasing version for rotation |
+
+**Signature Scope**: The signature covers the deterministic CBOR encoding of all fields except `signature` itself (keys 0-5).
+
+**App Scoping**: Each `app_id` has its own KeyBinding. A single PKARR identity MAY publish multiple KeyBindings for different apps. Peers discover a specific app's KeyBinding by querying for the relevant `app_id`.
 
 **Timestamp Privacy**:
 
@@ -818,6 +870,32 @@ The XX pattern authenticates both parties to each other during the handshake, bu
 
 **Prevention**: Once IK pattern is used with a pinned key, active MITM requires key compromise.
 
+#### 6.8.5 AppKey Discovery via KeyBinding
+
+For applications requiring delegated signing (proof-of-authorship, typed request signing, optional envelope signatures), KeyBinding MAY include an `app_keys` array.
+
+**AppKeyEntry** (CBOR array or map):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ed25519_pub` | bytes(32) | REQUIRED | Delegated Ed25519 signing key (AppKey) |
+| `cert_id` | bytes(16) | REQUIRED | Identifier for the full AppCert: `first_16_bytes(SHA256(cert_body))` |
+| `expires_at` | uint | OPTIONAL | Unix seconds; if present, entry is invalid after this time |
+
+**AppCert Discovery Flow**:
+
+1. Peer fetches KeyBinding for target `(peerid, app_id)`
+2. If `app_keys` array is present, peer extracts the `cert_id` for the desired AppKey
+3. Peer fetches the full AppCert using `cert_id`:
+   - Via PKARR metadata pointer, OR
+   - Via homeserver path: `/pub/{app_id}/v0/certs/{cert_id_hex}`
+4. Peer verifies AppCert signature against `peerid` (the RootKey)
+5. Peer verifies the AppKey in AppCert matches the `ed25519_pub` in KeyBinding
+
+**Rationale**: This provides a single discovery root (KeyBinding) while allowing lazy fetching of full AppCerts only when needed for signature verification. Apps that don't need AppKey can ignore this field.
+
+**Relationship to PUBKY_UNIFIED_KEY_DELEGATION_SPEC**: The AppCert schema, issuance, and detailed verification rules are defined in the Delegation Spec. This section only defines how AppKeys are discovered via KeyBinding.
+
 ### 6.9 Protocol Symmetry Considerations
 
 **Current Architecture**: pubky-noise uses client-server model (`client.rs`, `server.rs`). One peer initiates (client), one responds (server).
@@ -898,6 +976,7 @@ The header is a CBOR map using **integer keys** for compactness (see Section 7.1
 | 8 | `sender_ephemeral_pub` | bytes(32) | **REQUIRED** | Sender's ephemeral X25519 public key for DH |
 | 9 | `sender_peerid` | bytes(32) | **REQUIRED** | Sender's Ed25519 public key (for routing) |
 | 10 | `sig` | bytes(64) | REQUIRED (Paykit) | Ed25519 signature for sender authenticity |
+| 11 | `cert_id` | bytes(16) | Optional | AppCert identifier; if present, `sig` uses AppKey (see 7.2.2) |
 
 **msg_id Type (Normative)**:
 
@@ -949,6 +1028,39 @@ Where:
 
 **Trust Rule**: Without a valid signature, treat `sender_peerid` as routing metadata only, not proven identity. For Paykit purposes (request, proposal, ack), missing or invalid `sig` MUST cause message rejection.
 
+### 7.2.2 Delegated Signature via AppKey (Optional)
+
+When header field 11 (`cert_id`) is present, the `sig` field (key 10) is verified against a delegated **AppKey** instead of the RootKey (`sender_peerid`).
+
+**Signing (sender)**:
+
+1. Sender MUST have a valid AppCert issued by their RootKey
+2. Sender includes `cert_id = first_16_bytes(SHA256(cert_body))` in header (key 11)
+3. Sender computes `sig_input` as in Section 7.2.1
+4. Sender signs: `sig = Ed25519_Sign(app_key_sk, sig_input)`
+
+**Verification (receiver)**:
+
+1. Extract `cert_id` (key 11) from header
+2. Fetch AppCert using `cert_id`:
+   - Via sender's KeyBinding `app_keys[]` entry, then full cert from homeserver, OR
+   - Via cached AppCert if previously verified
+3. Verify AppCert signature against `sender_peerid` (the RootKey)
+4. Extract `app_ed25519_pub` from verified AppCert
+5. Compute `sig_input` as in Section 7.2.1
+6. Verify `sig` (key 10) against `app_ed25519_pub`
+
+**RootKey Signing (no cert_id)**:
+
+If `cert_id` is absent, verify `sig` directly against `sender_peerid` as in Section 7.2.1. This supports applications that have not adopted AppCert delegation.
+
+**Security Properties**:
+
+- RootKey remains semi-cold; routine signing uses AppKey
+- AppCert chain provides verifiable delegation from identity
+- Envelope still binds to `sender_peerid` via AAD
+
+**Reference**: See [PUBKY_UNIFIED_KEY_DELEGATION_SPEC](PUBKY_UNIFIED_KEY_DELEGATION_SPEC_v0.2.md) Section 5 for AppCert schema and issuance.
 
 ### 7.3 Key Derivation (Envelopes)
 
@@ -1084,6 +1196,42 @@ sig = Ed25519_Sign(sender_peerid_sk, sig_input)
 
 **Trust Rule**: The `sender_peerid` field is authenticated via AAD (tamper-evident), but the sender identity is **trusted** only if `sig` verifies. Without a valid signature, treat `sender_peerid` as routing metadata, not proven identity. For Paykit purposes (request, proposal, ack), missing or invalid `sig` MUST cause message rejection.
 
+#### 7.6.1 Signing Hierarchy (Normative, Cross-Spec Reference)
+
+This section defines the **authoritative signing policy** for the Pubky ecosystem. Delegation Spec and application specs (Atomicity, etc.) MUST reference this table rather than defining independent signing rules.
+
+**Key Roles**:
+
+| Key | Name | Custody | Purpose |
+|-----|------|---------|---------|
+| RootKey | PKARR Ed25519 identity | Ring (semi-cold) | Identity anchor; signs only binding artifacts |
+| AppKey | Delegated Ed25519 | App (via AppCert) | Typed application signatures |
+| TransportKey | X25519 static | App | Noise session authentication |
+| InboxKey | X25519 static | App | Sealed Blob stored delivery encryption |
+
+**Signing Policy by Context**:
+
+| Context | Signature Required? | Signing Key | Verifier Fetches |
+|---------|---------------------|-------------|------------------|
+| **KeyBinding publication** | REQUIRED | RootKey | (Self-signed; peerid in binding) |
+| **AppCert issuance** | REQUIRED | RootKey | (Self-signed; issuer_peerid in cert) |
+| **Noise live session** | NOT REQUIRED | N/A (session auth) | TransportKey via KeyBinding for IK |
+| **Sealed Blob (via Noise)** | NOT REQUIRED | N/A | Noise provides auth |
+| **Sealed Blob (stored delivery)** | RECOMMENDED | AppKey (preferred) OR RootKey | KeyBinding + AppCert if cert_id present |
+| **Public content (Pubky App)** | RECOMMENDED | AppKey | AppCert via KeyBinding |
+| **Settlement proof (Atomicity)** | REQUIRED | AppKey (preferred) OR RootKey | KeyBinding + AppCert if cert_id present |
+
+**Invariants**:
+
+1. **RootKey is semi-cold**: RootKey signing is reserved for:
+   - KeyBinding publication (key rotation, app registration)
+   - AppCert issuance (delegating signing authority)
+   - Rare high-value evidence artifacts where AppKey is unavailable
+2. **Routine signing uses AppKey**: Apps with AppCert SHOULD use AppKey for envelope signatures, typed content, and request proofs.
+3. **Noise provides session auth**: Messages within an active Noise session do not require additional signatures unless the artifact will be stored/verified offline.
+4. **TOFU is first-class**: Noise XX first-contact (TOFU) is the default bootstrap; pre-verified KeyBinding strengthens trust but does not replace TOFU.
+
+**Delegation Spec Reference**: See [PUBKY_UNIFIED_KEY_DELEGATION_SPEC](PUBKY_UNIFIED_KEY_DELEGATION_SPEC_v0.2.md) for AppCert schema, issuance flow, SignedContent envelope, and DPoP-like request signing.
 
 ### 7.7 Terminology and ContextId Definition
 
@@ -1772,7 +1920,7 @@ This section documents gaps between the spec and current implementation.
 | RingKeyProvider trait | ✅ Implemented | `pubky-noise/src/ring.rs` |
 | Identity binding in handshake | ✅ Implemented | `pubky-noise/src/identity_payload.rs` |
 | Secure handoff (Ring → Bitkit) | ✅ Implemented | `pubky-ring/src/utils/actions/paykitConnectAction.ts` |
-| Domain separation (single X25519 key) | ✅ Specified | Section 4.7 |
+| InboxKey/TransportKey separation | ✅ Specified | Section 4.7 |
 
 ### C.2 Specified (Pending Implementation)
 
@@ -1848,6 +1996,43 @@ If the spec exceeds ~3000 lines or async messaging exceeds ~1200 lines, consider
 | `PUBKY_MESSAGING.md` | 7, Appendix B-C | Sealed Blob, ACK, storage format |
 
 Each document would include a "Related Documents" section with version compatibility matrix.
+
+---
+
+## Appendix E: Implementation Impact (Non-Normative)
+
+This appendix summarizes the likely implementation changes required for vNext updates.
+
+### E.1 pubky-noise
+
+| Change | Impact | Priority |
+|--------|--------|----------|
+| IdentityPayload handling | Already updated (Jan 2026) | Done |
+| KeyBinding discovery | Add PKARR KeyBinding fetch for IK pattern | Medium |
+| TransportKey separation | Ensure TransportKey != InboxKey in identity flow | High |
+
+### E.2 pubky-ring
+
+| Change | Impact | Priority |
+|--------|--------|----------|
+| Typed signing API | Implement `sign_keybinding()`, `sign_appcert()` functions | High |
+| KeyBinding publication | Add `app_keys[]` support in key management | Medium |
+
+### E.3 Sealed Blob Handling (paykit, bitkit)
+
+| Change | Impact | Priority |
+|--------|--------|----------|
+| `cert_id` header field | Add optional field 11 to header parsing/creation | Medium |
+| AppKey signature verification | Implement Section 7.2.2 verification path | Medium |
+| InboxKey usage | Ensure Sealed Blob encrypts to InboxKey, not TransportKey | High |
+
+### E.4 Atomicity
+
+| Change | Impact | Priority |
+|--------|--------|----------|
+| KeyBinding discovery | Implement PKARR KeyBinding fetch | High |
+| Covenant signing | Use Noise auth (live) or AppKey (stored) | Medium |
+| Idempotency mapping | Ensure `msg_id` == `request_id` in envelope creation | Medium |
 
 ---
 
