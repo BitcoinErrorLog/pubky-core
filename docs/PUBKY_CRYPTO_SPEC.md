@@ -34,6 +34,7 @@ This specification defines the cryptographic primitives, key derivation schemes,
    - 7.5 [AAD Construction](#75-aad-construction)
    - 7.6 [Optional Sender Signature](#76-optional-sender-signature)
    - 7.7 [ContextId Definition](#77-contextid-definition)
+   - 7.7.3 [Traffic Analysis Note](#773-traffic-analysis-note-contextid-metadata-leakage)
    - 7.8 [Storage Layout](#78-storage-layout-paykit-v0)
    - 7.9 [Encrypted ACK Protocol](#79-encrypted-ack-protocol)
    - 7.12 [Canonical Encoding Rules](#712-canonical-encoding-rules)
@@ -44,7 +45,13 @@ This specification defines the cryptographic primitives, key derivation schemes,
 9. [Key Rotation](#9-key-rotation)
 10. [Backup and Restore](#10-backup-and-restore)
 11. [Security Considerations](#11-security-considerations)
+   - 11.7 [Data Remanence and Module Extraction](#117-data-remanence-and-module-extraction)
+   - 11.8 [Ring API Rate Limiting and Bounded Exposure](#118-ring-api-rate-limiting-and-bounded-exposure)
 12. [Implementation Reference](#12-implementation-reference)
+   - 12.3 [Dependency Tree](#123-dependency-tree)
+   - 12.4 [Connection State Machine](#124-connection-state-machine-non-normative)
+13. [Ring Transport Abstraction](#13-ring-transport-abstraction)
+14. [Transport Architecture](#14-transport-architecture)
 
 **Appendices**:
 - [Appendix A: Domain Separation Strings](#appendix-a-domain-separation-strings)
@@ -1314,6 +1321,31 @@ Where:
 4. Lowercase
 5. Validate length (52 chars) and z-base-32 alphabet
 
+#### 7.7.3 Traffic Analysis Note (ContextId Metadata Leakage)
+
+The use of `context_id` in storage paths (Section 7.8) creates observable metadata:
+
+| Observation | Leaks |
+|-------------|-------|
+| Distinct `context_id` values in a user's outbox | Number of active threads |
+| Same `context_id` in two users' storage | Communication relationship between those users |
+| Polling frequency per `context_id` path | Activity level per thread |
+| Timing correlation of new `context_id` appearance | When a new conversation started |
+
+**MVP Design (Normative)**:
+
+Each inbox/outbox uses one `context_id` per thread. This is the simplest model for polling and ACK routing. Implementations MUST accept this metadata trade-off for MVP.
+
+**Future Mitigation: Single-Inbox Model**:
+
+A future revision MAY define a single-inbox model where:
+- All messages for a user land in a single inbox path (no per-thread path)
+- `context_id` appears only inside the encrypted envelope
+- The homeserver cannot observe which threads are active
+- Recipients demultiplex by `context_id` after decryption
+
+This model trades polling simplicity for metadata resistance. It is NOT normative in this version.
+
 ### 7.8 Storage Layout (Paykit v0)
 
 | Object Type | Path | Stored On |
@@ -1833,6 +1865,55 @@ Out of scope for initial release. Future mitigations:
 - Randomized polling intervals
 - Decoy traffic
 
+### 11.7 Data Remanence and Module Extraction
+
+Cryptographic modules that handle secret material (keys, seeds, derived secrets) SHOULD be isolated into dedicated crates or modules. This provides:
+
+| Benefit | Description |
+|---------|-------------|
+| Audit surface reduction | Smaller crate is easier to audit for memory safety |
+| Dependency isolation | Crypto code has minimal non-crypto dependencies |
+| Zeroize enforcement | Dedicated crate can enforce `zeroize` on all secret types at the crate boundary |
+| Data remanence control | Secrets are less likely to leak into unrelated data structures when crypto is isolated |
+
+**Data Remanence Risk**: When cryptographic operations are interleaved with networking, serialization, and application logic, secret material may be inadvertently copied into buffers, logs, or heap allocations that are not zeroized. Extracting pure cryptographic primitives into a dedicated module (`pubky-crypto`) limits the blast radius of such leaks.
+
+**Normative Requirement**: Implementations SHOULD structure their crate dependency graph such that pure cryptographic primitives (key derivation, AEAD, signing helpers) reside in a dedicated crate that does not depend on networking, async runtimes, or transport libraries.
+
+### 11.8 Ring API Rate Limiting and Bounded Exposure
+
+Ring MUST rate-limit all derivation and signing API calls to prevent resource exhaustion attacks. A compromised or malicious app could attempt to:
+
+| Attack | Description |
+|--------|-------------|
+| Key grinding | Request derivations for many key versions to exhaust CPU |
+| Memory exhaustion | Trigger unbounded key cache growth via derivation requests |
+| Timing side-channels | High-frequency derivation calls to extract timing information |
+
+**Normative Requirements**:
+
+| Requirement | Description |
+|-------------|-------------|
+| Per-app rate limit | Ring MUST enforce a maximum derivation call rate per `app_id` (recommended: 10 calls/second) |
+| Global rate limit | Ring SHOULD enforce a global derivation call rate across all apps (recommended: 50 calls/second) |
+| Backpressure | When rate limit is exceeded, Ring MUST return an error, not queue indefinitely |
+| No unbounded state | Ring API calls MUST NOT create unbounded internal state (see Section 5.3.2) |
+
+**BIP32 Precedent**: The BIP32 hierarchical derivation standard limits derivation depth and breadth via fixed path structure. Ring follows a similar philosophy: derivation is bounded by `max_key_version` counters, not by attacker-controlled inputs.
+
+**Unbounded API Exposure**:
+
+Ring MUST NOT expose API calls that allow unbounded iteration or derivation. Specifically:
+
+| Prohibited Pattern | Why |
+|--------------------|-----|
+| `derive_key(arbitrary_index)` without upper bound | Attacker can grind all possible indices |
+| `list_all_keys()` without pagination | Unbounded memory allocation |
+| `sign(arbitrary_bytes)` | Signature phishing (see Section 5.3.5) |
+| Any API that creates state keyed by attacker-controlled input | Unbounded state growth |
+
+All Ring API calls MUST operate within the bounded version model defined in Section 5.3.2. Applications MUST NOT relay attacker-controlled values (such as `inbox_kid` from received envelopes) directly into Ring derivation calls. Instead, applications look up `kid → key_version` in their local bounded cache and pass only the validated `key_version` to Ring.
+
 ---
 
 ## 12. Implementation Reference
@@ -1843,6 +1924,7 @@ Out of scope for initial release. Future mitigations:
 |------------|---------|
 | `pubky-ring` | Identity management, seed custody, authorization |
 | `pubky-noise` | Noise handshake, transport, envelopes |
+| `pubky-crypto` | Pure cryptographic primitives (SB2, UKD, KDF, X25519/Ed25519 helpers) |
 | `paykit-rs` | Payment protocols, receipts, subscriptions |
 | `bitkit-android` / `bitkit-ios` | Wallet integration |
 | `pubky-core` | Homeserver, SDK, storage |
@@ -1851,16 +1933,234 @@ Out of scope for initial release. Future mitigations:
 
 | File | Purpose |
 |------|---------|
-| `pubky-noise/src/kdf.rs` | Key derivation functions |
+| `pubky-crypto/src/kdf.rs` | Key derivation functions (pure crypto) |
+| `pubky-crypto/src/sealed_blob.rs` | Sealed Blob v1 envelope encryption |
+| `pubky-crypto/src/sealed_blob_v2.rs` | Sealed Blob v2 binary wire format |
+| `pubky-crypto/src/ukd.rs` | Unified Key Delegation helpers |
+| `pubky-crypto/src/secure_mem.rs` | Secure memory operations (feature-gated) |
+| `pubky-crypto/src/errors.rs` | CryptoError type |
 | `pubky-noise/src/ring.rs` | RingKeyProvider trait |
-| `pubky-noise/src/sealed_blob.rs` | Envelope encryption |
 | `pubky-noise/src/session_id.rs` | Session identifier |
 | `pubky-noise/src/transport.rs` | Noise transport wrapper |
 | `pubky-noise/src/identity_payload.rs` | Identity binding |
 
-### 12.3 Test Vectors
+**Note**: Pure cryptographic primitives (KDF, sealed blob, UKD, ed25519/x25519 helpers) are extracted into `pubky-crypto`. `pubky-noise` re-exports these modules for backward compatibility.
 
-Test vectors for interoperability testing are defined in `pubky-noise/tests/`.
+### 12.3 Dependency Tree
+
+```
+pubky-ring (identity custody, seed management)
+└── pubky-noise (Noise handshake, transport, envelopes)
+    └── pubky-crypto (pure crypto: SB2, UKD, KDF, X25519/Ed25519 helpers)
+
+paykit-rs (payment protocols, receipts, subscriptions)
+├── pubky-noise (for Noise transport types)
+└── pubky-crypto (for crypto primitives directly)
+
+atomicity-core (P2P credit protocol)
+├── pubky-noise (for Noise transport types)
+└── pubky-crypto (for crypto primitives directly)
+
+bitkit-android / bitkit-ios (wallet integration)
+└── paykit-rs (via UniFFI)
+    ├── pubky-noise
+    └── pubky-crypto
+```
+
+**Layering Rule**: Applications that need only cryptographic primitives (key derivation, AEAD, signing) SHOULD depend on `pubky-crypto` directly rather than pulling in `pubky-noise` (which carries Noise protocol, async runtime, and transport dependencies).
+
+### 12.4 Connection State Machine (Non-Normative)
+
+This section describes a proposed future architecture for managing shared channels between peers. It is **non-normative** and documents the target design for post-MVP development.
+
+**Layered Architecture**:
+
+```
+┌─────────────────────────────────────────────┐
+│ Subscribers (Paykit, Atomicity, Pubky App)   │
+│ Application-specific message handling        │
+├─────────────────────────────────────────────┤
+│ Connection State Machine                     │
+│ ACK management, message ordering,            │
+│ reconnection logic, delivery guarantees      │
+├─────────────────────────────────────────────┤
+│ Noise Stack                                  │
+│ Single channel per PKARR pubkey pair         │
+│ XX/IK handshake, ChaCha20-Poly1305 transport │
+└─────────────────────────────────────────────┘
+```
+
+**Key Properties**:
+
+| Property | Description |
+|----------|-------------|
+| Channel multiplexing | Single Noise channel per peer pair, shared by all subscribers |
+| Subscriber isolation | Each subscriber (Paykit, Atomicity) has its own message namespace |
+| Connection management | Automatic reconnection with exponential backoff |
+| Ordering guarantees | Per-subscriber FIFO ordering within a channel |
+| ACK consolidation | Single ACK mechanism shared across subscribers |
+
+**Rationale**: Currently, each application (Paykit, Atomicity) manages its own connection state independently. This leads to redundant connections to the same peer and inconsistent reconnection behavior. The Connection State Machine consolidates these into a single managed channel.
+
+**Current State**: This architecture is not yet implemented. Current implementations use per-application connection management with stored delivery (Section 14.2) as the primary transport.
+
+### 12.5 Test Vectors
+
+Test vectors for interoperability testing are defined in `pubky-noise/tests/` and (after extraction) `pubky-crypto/tests/`.
+
+---
+
+## 13. Ring Transport Abstraction
+
+### 13.1 Purpose
+
+Ring is a local cryptographic component that MUST NOT have network access (Section 1.1). However, Ring must communicate with apps (Bitkit, Paykit) for:
+
+- Key derivation requests and responses
+- Authorization (AppCert issuance, KeyBinding signing)
+- Secure handoff of derived material
+
+This section defines the transport-agnostic interface for Ring-to-App communication.
+
+### 13.2 Interface Design
+
+Ring exposes a **bytes-in/bytes-out** interface suitable for FFI and cross-platform integration:
+
+| Property | Requirement |
+|----------|-------------|
+| Transport-agnostic | Interface accepts and returns byte arrays |
+| C-compatible | All types are FFI-safe (no closures, no function pointers) |
+| Synchronous | Ring operations are computation-only; no async/await |
+| Stateless per call | Each call is independent (Ring maintains internal counters only) |
+
+**Request/Response Model**:
+
+```
+App → Ring: request_bytes (typed operation + parameters)
+Ring → App: response_bytes (result or error)
+```
+
+All request and response types are defined in Section 5.3 (Ring FFI Interface). This section addresses the *transport layer* that carries those requests.
+
+### 13.3 Deployment Topologies
+
+| Topology | Description | Status |
+|----------|-------------|--------|
+| **Same-device** | Ring and App run on the same device. Requests are in-process function calls or local IPC. | ✅ MVP |
+| **Cross-device (relay)** | Ring runs on a separate device (e.g., phone). Requests are relayed via HTTP relay + deep links. | ✅ MVP |
+| **Cross-device (USB/BLE)** | Ring communicates with App via USB or Bluetooth Low Energy. | ❌ Future |
+
+### 13.4 Same-Device Transport
+
+When Ring and the App run on the same device:
+
+- Ring is embedded as a library (static or dynamic linking)
+- Calls are direct function invocations via FFI
+- No serialization overhead for same-process calls
+- UniFFI generates language bindings (Kotlin, Swift, TypeScript)
+
+**Current Implementation**: pubky-ring embeds pubky-noise as a React Native native module. Bitkit calls Ring via the React Native bridge (same device).
+
+### 13.5 Cross-Device Transport (Relay)
+
+When Ring runs on a different device (e.g., Ring on phone, Bitkit on desktop):
+
+- Uses the Pubky Auth flow (see [AUTH.md](AUTH.md))
+- HTTP relay forwards encrypted messages between devices
+- Deep links trigger Ring UI for user consent
+- AuthToken is encrypted with a shared secret (`client_secret`)
+
+**Relay Security Properties**:
+
+| Property | Guarantee |
+|----------|-----------|
+| Relay confidentiality | AuthToken encrypted with `client_secret`; relay cannot read |
+| Replay prevention | Timestamp-based token validity window (±45 seconds) |
+| Channel binding | `channel_id = hash(client_secret)` prevents misdirection |
+
+### 13.6 Open Questions (Deferred)
+
+| Question | Status |
+|----------|--------|
+| Should Ring↔App same-user cross-device use Noise? | Deferred. Current relay model is sufficient for MVP. Noise would add forward secrecy but requires persistent session state on Ring, violating the stateless design. |
+| BLE transport profile for Ring↔App | Deferred to post-MVP. Requires platform-specific BLE stack integration. |
+| Multi-device Ring synchronization | Out of scope. Each device has its own Ring instance with independently derived keys. |
+
+---
+
+## 14. Transport Architecture
+
+This section documents the transport architecture analysis and normative MVP selection for peer-to-peer message delivery.
+
+### 14.1 Transport Models
+
+Three transport models were evaluated for delivering messages between peers:
+
+| Model | Description | MVP? |
+|-------|-------------|------|
+| **auth_server + stored blobs** | Homeserver authentication → Sealed Blob v2 delivery | ✅ **Normative** |
+| **Direct P2P Noise** | Direct Noise connection, no homeserver | ❌ Not viable for MVP |
+| **Noise-then-auth-then-Noise** | Full end-to-end encryption with homeserver relay | ❌ Long-term ideal |
+
+### 14.2 Normative Model: Homeserver Auth + Stored Blobs
+
+The MVP transport model uses homeserver-mediated stored delivery:
+
+1. **Sender** authenticates to their own homeserver (or the recipient's homeserver, depending on the storage layout)
+2. **Sender** encrypts the message as a Sealed Blob v2 (Section 7.2)
+3. **Sender** writes the encrypted blob to the appropriate storage path (Section 7.8)
+4. **Recipient** polls the storage path for new messages
+5. **Recipient** decrypts using their InboxKey
+
+**Properties**:
+
+| Property | Value |
+|----------|-------|
+| Confidentiality | Sealed Blob v2 (XChaCha20-Poly1305) |
+| Sender authenticity | Ed25519 signature in header (Section 7.2.1) |
+| Homeserver trust | Untrusted (cannot read message content) |
+| Availability | Depends on homeserver uptime |
+| Latency | Polling-based (seconds to minutes) |
+
+### 14.3 Direct P2P Noise (Not Selected)
+
+Direct Noise connections between peers were evaluated and rejected for MVP:
+
+| Issue | Description |
+|-------|-------------|
+| Mobile IP instability | Mobile devices change IP addresses frequently; NAT traversal is unreliable |
+| Both parties online | Noise requires both parties to be simultaneously reachable |
+| Firewall traversal | Many mobile networks block incoming connections |
+| Battery impact | Maintaining a listening socket on mobile is battery-intensive |
+
+**Future Use**: Direct P2P Noise remains viable for desktop-to-desktop or same-network scenarios. It MAY be offered as an optional transport in future revisions.
+
+### 14.4 Noise-then-Auth-then-Noise (Long-Term Ideal)
+
+The ideal long-term architecture layers Noise over homeserver relay:
+
+```
+Sender ──Noise──▶ Sender's Homeserver ──relay──▶ Recipient's Homeserver ──Noise──▶ Recipient
+```
+
+**Advantages**:
+
+| Property | Description |
+|----------|-------------|
+| Full forward secrecy | Every session has ephemeral keys |
+| Metadata protection | Homeserver sees encrypted Noise frames, not Sealed Blob headers |
+| Bidirectional | Full duplex communication within session |
+| Stream support | Can support streaming/chunked delivery |
+
+**Challenges**:
+
+| Issue | Description |
+|-------|-------------|
+| Complexity | Requires Noise session management on homeserver |
+| State | Homeserver must maintain Noise session state for relay |
+| Offline delivery | Still needs Sealed Blob fallback for offline recipients |
+
+This model is **NOT normative** in this version. It is documented as the target architecture for future work.
 
 ---
 
@@ -1938,6 +2238,13 @@ This section documents gaps between the spec and current implementation.
 | Canonical encoding (CBOR headers) | 📋 Specified | Section 7.12; deterministic CBOR per RFC 8949 |
 | kid 16-byte derivation | 📋 Specified | Section 7.2; `first_16_bytes(SHA256(pk))` |
 | Backup transport allowance | 📋 Specified | Section 1.4; Noise may carry encrypted backup blobs |
+| ContextId traffic analysis | 📋 Specified | Section 7.7.3; metadata leakage acknowledged, single-inbox deferred |
+| Data remanence module extraction | 📋 Specified | Section 11.7; pubky-crypto extraction rationale |
+| Ring API rate limiting | 📋 Specified | Section 11.8; bounded exposure requirements |
+| Ring Transport Abstraction | 📋 Specified | Section 13; bytes-in/bytes-out, deployment topologies |
+| Transport Architecture (MVP) | 📋 Specified | Section 14; homeserver auth + stored blobs normative |
+| Connection State Machine | 📋 Specified | Section 12.4; non-normative future architecture |
+| pubky-crypto dependency tree | 📋 Specified | Section 12.3; layered crate architecture |
 
 ### C.3 Not Yet Implemented
 
@@ -1964,11 +2271,14 @@ This specification currently covers:
 - **Core Cryptography** (Sections 1-4): ~165 lines - primitives, identity, key hierarchy
 - **Device Layer** (Section 5): ~186 lines - Ring FFI, platform integration
 - **Live Transport** (Section 6): ~293 lines - Noise protocol, handshakes
-- **Async Messaging** (Section 7): ~703 lines - Sealed Blob, ACK, storage
-- **Binding & Security** (Sections 8-11): ~225 lines - session binding, rotation, backup
-- **Implementation** (Section 12, Appendices): ~250 lines - reference, domain strings
+- **Async Messaging** (Section 7): ~730 lines - Sealed Blob, ACK, storage, traffic analysis
+- **Binding & Security** (Sections 8-11): ~280 lines - session binding, rotation, backup, rate limiting
+- **Implementation** (Section 12): ~130 lines - repositories, dependency tree, connection state machine
+- **Ring Transport** (Section 13): ~75 lines - deployment topologies, relay security
+- **Transport Architecture** (Section 14): ~75 lines - MVP model selection
+- **Appendices** (A-E): ~250 lines - domain strings, encoding, status, organization
 
-Total: ~1900 lines
+Total: ~2340 lines
 
 ### D.2 Split Recommendation
 
@@ -1987,12 +2297,12 @@ Reasons to consider future split:
 
 ### D.3 If Splitting Becomes Necessary
 
-If the spec exceeds ~3000 lines or async messaging exceeds ~1200 lines, consider:
+If the spec exceeds ~3500 lines or async messaging exceeds ~1200 lines, consider:
 
 | Document | Sections | Audience |
 |----------|----------|----------|
-| `PUBKY_CRYPTO_CORE.md` | 1-5, 9-11, Appendix A | Core crypto, Ring, key derivation |
-| `PUBKY_TRANSPORT.md` | 6, 8 | Noise handshake, session binding |
+| `PUBKY_CRYPTO_CORE.md` | 1-5, 9-11, 13, Appendix A | Core crypto, Ring, key derivation, Ring transport |
+| `PUBKY_TRANSPORT.md` | 6, 8, 14 | Noise handshake, session binding, transport architecture |
 | `PUBKY_MESSAGING.md` | 7, Appendix B-C | Sealed Blob, ACK, storage format |
 
 Each document would include a "Related Documents" section with version compatibility matrix.
