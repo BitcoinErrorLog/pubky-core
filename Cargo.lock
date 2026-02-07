@@ -3827,6 +3827,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pubky-crypto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "rand 0.8.5",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "pubky-homeserver"
 version = "0.6.0-rc.6"
 dependencies = [
@@ -3903,6 +3924,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hkdf",
+ "pubky-crypto",
  "rand 0.8.5",
  "serde",
  "serde_bytes",
