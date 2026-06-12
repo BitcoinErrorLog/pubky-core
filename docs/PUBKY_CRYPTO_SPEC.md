@@ -1,10 +1,12 @@
 # Pubky Cryptographic Specification
 
-**Version**: 2.5  
-**Date**: January 2026  
-**Status**: Authoritative Reference
+**Version**: 2.6  
+**Date**: June 2026  
+**Status**: Authoritative Reference (maintained in the BitcoinErrorLog pubky-core fork; **Proposed upstream** to the official `pubky` org)
 
 This specification defines the cryptographic primitives, key derivation schemes, transport protocols, and envelope formats used across the Pubky ecosystem (pubky-ring, pubky-noise, paykit, bitkit).
+
+> **Two Noise implementations exist** (as of June 2026): the BitcoinErrorLog `pubky-noise` fork implements Section 6 of this spec as written (the **Direct profile**: BLAKE2s suites, fixed prologue, IdentityPayload binding). The official [`pubky/pubky-noise`](https://github.com/pubky/pubky-noise) library is an independent implementation with a different suite and architecture (the **Storage-polling profile**). The two CANNOT interoperate at the Noise layer. Section 6.10 specifies the differences and the upstream work required to converge. Section 7 (Sealed Blob stored delivery) is implemented only by the BitcoinErrorLog fork; the official library has no stored-delivery envelope.
 
 ### Related Specifications
 
@@ -28,6 +30,7 @@ This specification defines the cryptographic primitives, key derivation schemes,
    - 5.3 [Ring FFI Interface](#53-ring-ffi-interface)
 6. [Live Transport (Noise Protocol)](#6-live-transport-noise-protocol)
    - 6.8 [Key Binding and Pinning](#68-key-binding-and-pinning)
+   - 6.10 [Interoperability with the Official pubky/pubky-noise Library](#610-interoperability-with-the-official-pubkypubky-noise-library)
 7. [Async Messaging (Async Envelopes)](#7-async-messaging-async-envelopes)
    - 7.2 [Sealed Blob v2 Wire Format](#72-sealed-blob-v2-wire-format)
    - 7.3 [Key Derivation (Envelopes)](#73-key-derivation-envelopes)
@@ -120,8 +123,10 @@ The Pubky protocol distinguishes between two delivery modes:
 **Invariants**:
 1. Live transport uses Noise and encrypts plaintext message schemas
 2. Stored delivery uses Sealed Blob and encrypts plaintext message schemas
-3. **MUST NOT** store Noise transport ciphertext for offline delivery. Noise session keys are not exported; if session state is lost, queued Noise ciphertext becomes permanently undecryptable. Stored delivery MUST use Sealed Blob only.
+3. **MUST NOT** store Noise transport ciphertext for *offline delivery*. Noise session keys are not exported; if session state is lost, queued Noise ciphertext becomes permanently undecryptable. Stored delivery MUST use Sealed Blob only.
 4. MUST NOT wrap Sealed Blob inside Noise for stored delivery (anti-pattern: storing Noise-encrypted Sealed Blobs)
+
+**Boundary clarification (added in 2.6)**: The official `pubky/pubky-noise` library runs its *live transport over homeserver storage* — Noise packets are written to slot-indexed paths and polled. That is live transport with a storage medium, not stored delivery, and it is permitted because the library's session snapshots (Section 6.7) keep in-flight ciphertext recoverable for the session participants. Invariant 3 targets application code queuing Noise ciphertext for a recipient *outside* a managed session: anything that must remain decryptable independent of session state MUST be a Sealed Blob.
 
 **Allowed Exception (Backup Transport)**:
 
@@ -610,11 +615,25 @@ let plaintext = ring.decrypt_sealed_blob(&envelope, handle);
 
 ### 6.1 Supported Patterns
 
+Two Noise profiles exist; an implementation MUST declare which it speaks. The protocol-name difference makes them mutually non-interoperable by construction (Noise mixes the protocol name into the handshake hash).
+
+**Direct profile** (this spec's original normative target; implemented by `BitcoinErrorLog/pubky-noise`):
+
 | Pattern | Use Case |
 |---------|----------|
 | Noise_XX_25519_ChaChaPoly_BLAKE2s | First contact (TOFU) |
 | Noise_IK_25519_ChaChaPoly_BLAKE2s | Subsequent contact (server static pinned) |
 | Noise_NN_25519_ChaChaPoly_BLAKE2s | Anonymous/ephemeral (testing only) |
+
+**Storage-polling profile** (official [`pubky/pubky-noise`](https://github.com/pubky/pubky-noise), `0.1.0-rc5`):
+
+| Pattern | Status | Use Case |
+|---------|--------|----------|
+| Noise_XX_25519_ChaChaPoly_SHA256 | Implemented | Mutual authentication |
+| Noise_NN_25519_ChaChaPoly_SHA256 | Implemented | Anonymous flows |
+| Noise_IK/NK/N_25519_ChaChaPoly_SHA256 | Declared, not implemented (panics) | -- |
+
+See Section 6.10 for the full compatibility matrix and convergence requirements.
 
 ### 6.2 Handshake Flow (XX)
 
@@ -628,7 +647,7 @@ Initiator (Client)                    Responder (Server)
      |  ====== TRANSPORT MODE ======        |
 ```
 
-**Prologue Policy (Normative)**:
+**Prologue Policy (Normative, Direct profile)**:
 
 The prologue MUST be a fixed constant per protocol version. For v1:
 
@@ -637,6 +656,8 @@ prologue = b"pubky-noise-v1"  // 14 bytes
 ```
 
 Arbitrary or caller-supplied prologues are **PROHIBITED** to prevent covert channels and interoperability failures.
+
+> **Official library status**: `pubky/pubky-noise` does not currently set a prologue (equivalent to an empty prologue). Adopting the fixed prologue upstream is a convergence work item (Section 6.10); until then, the prologue requirement applies to the Direct profile only.
 
 **Rationale**: Antoine suggested making prologue a method parameter for flexibility. We chose a fixed constant instead because:
 1. Covert channels: Arbitrary prologues could be used to leak information
@@ -737,17 +758,25 @@ Post-handshake messages use the Noise transport mode with ChaCha20-Poly1305. The
 
 Noise uses a 64-bit little-endian counter as the nonce, encoded into a 96-bit (12-byte) nonce as per the Noise specification. The `snow` library manages this counter internally. Implementations **MUST NOT** manually manage Noise nonces. Attempting to set or export nonces breaks the security model.
 
-### 6.7 No State Persistence
+### 6.7 State Persistence Rules
 
 Implementations MUST NOT:
 - Export CipherState or transport keys from snow
-- Serialize Noise session state for cross-device restore
+- Serialize Noise session state for **cross-device** restore
 
 Implementations MAY persist:
 - Peer identity (Ed25519 public key)
 - Pinned Noise static (for IK pattern)
 - Last seen timestamp
 - Session metadata (not secrets)
+
+**Same-device crash recovery (Storage-polling profile)**: The official `pubky/pubky-noise` persists a session snapshot (`PubkyNoiseSessionState`, 197 bytes) containing the local *ephemeral seed and static secret* — not CipherState — and restores by replaying persisted handshake messages through a fresh Noise state. This is permitted as a same-device crash-recovery mechanism under these conditions:
+
+1. The snapshot MUST be stored with at-rest protection equivalent to the static key itself (platform keychain or encrypted under `LOCAL_ARCHIVE_KEY`)
+2. The snapshot MUST NOT be transferred to another device (key material is device-scoped)
+3. Snapshot loss MUST be treated as session loss: re-handshake, never attempt partial recovery
+
+**Rationale for the amendment** (changed in 2.6): v2.5 prohibited all session-state serialization on the grounds that lost state makes stored ciphertext permanently undecryptable. Snapshot-based recovery addresses the same risk from the other direction — making state loss recoverable — at the cost of persisting key material. Both postures are now specified; the prohibition on *CipherState export* and *cross-device* restore is unchanged.
 
 ### 6.8 Key Binding and Pinning
 
@@ -917,6 +946,33 @@ For applications requiring delegated signing (proof-of-authorship, typed request
 - **Option B**: Refactor pubky-noise toward symmetric peer API. Either side can initiate, both poll inbox.
 
 This decision should be made before significant new development on pubky-noise.
+
+### 6.10 Interoperability with the Official pubky/pubky-noise Library
+
+**Added in 2.6.** The official [`pubky/pubky-noise`](https://github.com/pubky/pubky-noise) (`0.1.0-rc5`) is an independent implementation with no shared history with the BitcoinErrorLog fork. Compatibility matrix, verified against both code bases (June 2026):
+
+| Property | This spec / BitcoinErrorLog fork (Direct profile) | Official library (Storage-polling profile) | Interoperable? |
+|----------|--------------------------------------------------|--------------------------------------------|----------------|
+| Suite hash | BLAKE2s (`Noise_*_25519_ChaChaPoly_BLAKE2s`) | SHA-256 (`Noise_*_25519_ChaChaPoly_SHA256`) | **No** — different protocol names produce different handshake hashes |
+| Prologue | `pubky-noise-v1` (fixed, normative §6.2) | None set | **No** — prologue mismatch fails handshake |
+| Patterns | XX, IK, NN implemented | XX, NN implemented; IK/NK/N declared but panic | Partial (XX, NN names only) |
+| Transport medium | Direct connection (TCP) | Homeserver storage, slot-indexed polling | Different architectures |
+| Identity binding (§6.3-6.4) | Implemented (IdentityPayload + BLAKE3 binding message, role byte, signature verified) | Struct declared (`ed25519_pub`, `noise_handshake`, `sig`; no `role`/`server_hint`); signing/verification **not implemented** | **No** |
+| Session state | No persistence (§6.7 original rule) | 197-byte snapshot incl. ephemeral seed + static secret, replay-based restore | Different postures (both now specified, §6.7) |
+| Sealed Blob (§7) | Implemented | **Absent** | N/A — official has no stored-delivery envelope |
+| X25519 path derivation | -- | `derive_asymmetric_paths` (SHA-256, domain-separated) | N/A (official-only feature, adopted by Atomicity profile) |
+
+**Consequence**: a Direct-profile endpoint and a Storage-polling-profile endpoint cannot complete a Noise handshake with each other. Applications MUST NOT mix profiles within one peer relationship.
+
+**Convergence work items (upstream proposals for `pubky/pubky-noise`)**:
+
+1. Adopt the fixed prologue `pubky-noise-v1` (§6.2) — prevents covert channels, version-binds the handshake
+2. Implement IdentityPayload signing and verification per §6.3-6.4 (BLAKE3 binding message with role byte) — without it, the official library's sessions bind X25519 ephemerals but do not authenticate Ed25519 identities
+3. Adopt Sealed Blob v2 (§7) or an equivalent sessionless stored-delivery envelope — required by Atomicity's MVP profile and any offline-first application
+4. Implement the declared `IK` pattern or remove it from the public enum (currently panics)
+5. Decide the suite question: either the official library adopts BLAKE2s, or this spec's Direct profile migrates to SHA-256 in its next breaking revision; carrying both indefinitely doubles the test surface
+
+Until items 1-2 land, the Direct profile remains the only implementation of this spec's Section 6 security properties; the Storage-polling profile provides confidentiality and forward secrecy but not spec-conformant identity binding.
 
 ---
 
