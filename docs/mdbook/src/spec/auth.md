@@ -114,9 +114,5 @@ In version zero the `pubky` **is** the `issuer`, meaning that the `AuthToken` is
 
 Having an `issuer` that isn't exactly the `pubky` means the `issuer` themselves need a certificate of delegation signed by the `pubky`. The problem with that is that you can either lookup that certificate on the Homeserver (making the verification process async and possibly taking too long to timeout) or do what most TLS apps do right now and send the certificates chain with the token. The problem with this is that you then have to deal with the eternal problem of revocation, which basically also forces you to go lookup somewhere making the the verification process async and possibly taking too long before timeout.
 
-### Expiration is out of scope
-While the token itself can only be used for very brief period, it is immediately exchanged for another authentication mechanism (usually a session ID). Deciding the expiration date of that authentication, if any, is out of the scope of this spec.
-
-The assumption here is that we are authorizing a session to the `Homeserver` such that the user can always access all active sessions and revoke any session that they don't like, all from the `Authenticator` app.
-
-Other services are free to choose their authentication system once the homeserver verifies the pubky auth token, whether that is a JWT or a Session with or without expiration and are free to allow the user to manage sessions the way they see fit.
+### Session expiry and owner revocation
+The AuthToken itself can only be used for a brief window. It is immediately exchanged for a homeserver session. That session has a stored expiry (default 30 days, configurable) enforced on every authenticated request. The key owner lists and revokes sessions from the Authenticator by signing a fresh root AuthToken — not by presenting a session cookie. See `docs/SESSION_REVOCATION.md`.

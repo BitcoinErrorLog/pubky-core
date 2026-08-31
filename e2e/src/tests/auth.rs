@@ -613,3 +613,202 @@ async fn test_republish_homeserver() {
 
     assert!(ts3 > ts2, "record should be republished when stale");
 }
+
+#[tokio::test]
+#[pubky_testnet::test]
+async fn expired_session_is_rejected() {
+    let mut testnet = Testnet::new().await.unwrap();
+    let pubky = testnet.sdk().unwrap();
+
+    let mut mock_dir = MockDataDir::test();
+    mock_dir.config_toml.general.session_ttl_seconds = 1;
+    let server = testnet
+        .create_homeserver_app_with_mock(mock_dir)
+        .await
+        .unwrap();
+
+    let signer = pubky.signer(Keypair::random());
+    let session = signer.signup(&server.public_key(), None).await.unwrap();
+    assert!(
+        session.info().expires_at().is_some(),
+        "new sessions must surface expires_at"
+    );
+
+    session
+        .storage()
+        .put("/pub/app/ttl.txt", "ok")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let err = session
+        .storage()
+        .put("/pub/app/ttl.txt", "late")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED),
+        "expired session must be rejected on the next write"
+    );
+
+    let still_valid = session.revalidate().await.unwrap();
+    assert!(
+        still_valid.is_none(),
+        "GET /session must not treat an expired session as valid"
+    );
+}
+
+#[tokio::test]
+#[pubky_testnet::test]
+async fn owner_can_list_and_revoke_sessions_without_leaking_secrets() {
+    let testnet = EphemeralTestnet::start().await.unwrap();
+    let server = testnet.homeserver_app();
+    let pubky = testnet.sdk().unwrap();
+
+    let signer = pubky.signer(Keypair::random());
+    let first = signer.signup(&server.public_key(), None).await.unwrap();
+    let second = signer.signin().await.unwrap();
+
+    first
+        .storage()
+        .put("/pub/app/one.txt", "one")
+        .await
+        .unwrap();
+    second
+        .storage()
+        .put("/pub/app/two.txt", "two")
+        .await
+        .unwrap();
+
+    let listed = signer.list_sessions().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    for descriptor in &listed {
+        assert!(descriptor.expires_at() > descriptor.created_at());
+        assert!(descriptor.capabilities().contains(&Capability::root()));
+        let encoded = serde_json::to_string(descriptor).unwrap();
+        assert!(
+            !encoded.contains("secret"),
+            "session listing must never include the session secret"
+        );
+    }
+
+    // A cookie holder cannot list or revoke-all. DELETE /sessions with only
+    // the cookie is the stolen-cookie attack on revoke-all.
+    let cookie_revoke = first.storage().delete("/sessions").await.unwrap_err();
+    assert!(
+        matches!(cookie_revoke, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED),
+        "a bearer cookie must not authorize revoke-all"
+    );
+
+    let revoke_id = listed[0].id();
+    signer.revoke_session(revoke_id).await.unwrap();
+
+    let remaining = signer.list_sessions().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_ne!(remaining[0].id(), revoke_id);
+
+    let first_write = first
+        .storage()
+        .put("/pub/app/one.txt", "revoked")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(first_write, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED),
+        "revoked session must be rejected on the next request"
+    );
+
+    second
+        .storage()
+        .put("/pub/app/two.txt", "still-ok")
+        .await
+        .expect("the non-revoked session must keep working");
+}
+
+#[tokio::test]
+#[pubky_testnet::test]
+async fn third_party_cannot_list_or_revoke_another_users_sessions() {
+    let testnet = EphemeralTestnet::start().await.unwrap();
+    let server = testnet.homeserver_app();
+    let pubky = testnet.sdk().unwrap();
+
+    let alice = pubky.signer(Keypair::random());
+    let bob = pubky.signer(Keypair::random());
+    let alice_session = alice.signup(&server.public_key(), None).await.unwrap();
+    let bob_session = bob.signup(&server.public_key(), None).await.unwrap();
+
+    alice_session
+        .storage()
+        .put("/pub/app/alice.txt", "a")
+        .await
+        .unwrap();
+    bob_session
+        .storage()
+        .put("/pub/app/bob.txt", "b")
+        .await
+        .unwrap();
+
+    let alice_sessions = alice.list_sessions().await.unwrap();
+    let bob_sessions = bob.list_sessions().await.unwrap();
+    assert_eq!(alice_sessions.len(), 1);
+    assert_eq!(bob_sessions.len(), 1);
+    assert_ne!(alice_sessions[0].id(), bob_sessions[0].id());
+
+    let err = alice
+        .revoke_session(bob_sessions[0].id())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::NOT_FOUND),
+        "revoking another user's session id must not succeed"
+    );
+
+    bob_session
+        .storage()
+        .put("/pub/app/bob.txt", "still-b")
+        .await
+        .expect("bob's session must survive alice's revoke attempt");
+
+    assert_eq!(bob.list_sessions().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[pubky_testnet::test]
+async fn revoke_all_includes_the_calling_session() {
+    let testnet = EphemeralTestnet::start().await.unwrap();
+    let server = testnet.homeserver_app();
+    let pubky = testnet.sdk().unwrap();
+
+    let signer = pubky.signer(Keypair::random());
+    let first = signer.signup(&server.public_key(), None).await.unwrap();
+    let second = signer.signin().await.unwrap();
+
+    signer.revoke_all_sessions().await.unwrap();
+
+    assert!(signer.list_sessions().await.unwrap().is_empty());
+
+    let first_err = first
+        .storage()
+        .put("/pub/app/gone.txt", "x")
+        .await
+        .unwrap_err();
+    let second_err = second
+        .storage()
+        .put("/pub/app/gone.txt", "y")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(first_err, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED)
+    );
+    assert!(
+        matches!(second_err, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED)
+    );
+
+    let fresh = signer.signin().await.expect("owner can mint a new session");
+    fresh
+        .storage()
+        .put("/pub/app/back.txt", "ok")
+        .await
+        .unwrap();
+    assert_eq!(signer.list_sessions().await.unwrap().len(), 1);
+}

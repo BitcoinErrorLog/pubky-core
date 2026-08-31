@@ -2,6 +2,9 @@
 signup_mode = "token_required"
 user_storage_quota_mb = 0
 database_url = "postgres://localhost:5432/pubky_homeserver"
+# Session cookie and stored-session lifetime in seconds. 0 is treated as this default.
+# Existing sessions keep the 365-day lifetime they were issued; only new sessions use this value.
+session_ttl_seconds = 2592000
 
 [drive]
 pubky_listen_socket = "127.0.0.1:6287"

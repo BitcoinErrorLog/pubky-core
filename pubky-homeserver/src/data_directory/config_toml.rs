@@ -82,11 +82,50 @@ pub struct AdminToml {
     pub admin_password: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+/// Default lifetime for newly created sessions: 30 days.
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Lifetime assigned to sessions that existed before expiry was stored: 365 days,
+/// matching the cookie `max_age` those sessions were issued with.
+pub const LEGACY_SESSION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+
+fn default_session_ttl_seconds() -> u64 {
+    DEFAULT_SESSION_TTL_SECS
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct GeneralToml {
     pub signup_mode: SignupMode,
     pub user_storage_quota_mb: u64,
     pub database_url: ConnectionString,
+    /// Lifetime of newly created sessions, in seconds.
+    ///
+    /// `0` is treated as [`DEFAULT_SESSION_TTL_SECS`] (fail closed: never
+    /// "infinite", never "expire immediately" from a missing key).
+    #[serde(default = "default_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
+}
+
+impl Default for GeneralToml {
+    fn default() -> Self {
+        Self {
+            signup_mode: SignupMode::default(),
+            user_storage_quota_mb: 0,
+            database_url: ConnectionString::default(),
+            session_ttl_seconds: DEFAULT_SESSION_TTL_SECS,
+        }
+    }
+}
+
+impl GeneralToml {
+    /// Resolved session TTL. `0` (missing or explicit) becomes the 30-day default.
+    pub fn resolved_session_ttl_secs(&self) -> u64 {
+        if self.session_ttl_seconds == 0 {
+            DEFAULT_SESSION_TTL_SECS
+        } else {
+            self.session_ttl_seconds
+        }
+    }
 }
 
 /// A config for Homeserver tracing subscriber configuration
@@ -253,6 +292,11 @@ mod tests {
         let c = ConfigToml::default();
         assert_eq!(c.general.signup_mode, SignupMode::TokenRequired);
         assert_eq!(c.general.user_storage_quota_mb, 0);
+        assert_eq!(c.general.session_ttl_seconds, DEFAULT_SESSION_TTL_SECS);
+        assert_eq!(
+            c.general.resolved_session_ttl_secs(),
+            DEFAULT_SESSION_TTL_SECS
+        );
         assert_eq!(
             c.drive.icann_listen_socket,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6286))
@@ -313,9 +357,23 @@ mod tests {
         let parsed: ConfigToml = ConfigToml::from_str_with_defaults(s).unwrap();
         // Check that explicitly set values are preserved
         assert_eq!(parsed.general.signup_mode, SignupMode::Open);
+        assert_eq!(
+            parsed.general.session_ttl_seconds, DEFAULT_SESSION_TTL_SECS,
+            "omitted session_ttl_seconds must default to 30 days"
+        );
         // Other fields that were not set (left empty) should still match the default.
         assert_eq!(parsed.admin, ConfigToml::default().admin);
         assert_eq!(parsed.logging, ConfigToml::default().logging);
+    }
+
+    #[test]
+    fn test_zero_session_ttl_resolves_to_default() {
+        let mut parsed = ConfigToml::default();
+        parsed.general.session_ttl_seconds = 0;
+        assert_eq!(
+            parsed.general.resolved_session_ttl_secs(),
+            DEFAULT_SESSION_TTL_SECS
+        );
     }
 
     #[test]

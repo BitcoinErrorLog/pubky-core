@@ -13,17 +13,33 @@ pub struct FfiSessionInfo {
 
 impl From<&CoreSessionInfo> for FfiSessionInfo {
     fn from(info: &CoreSessionInfo) -> Self {
-        let caps_vec: Vec<String> = info.capabilities()
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        
+        let caps_vec: Vec<String> = info.capabilities().iter().map(|c| c.to_string()).collect();
+
         Self {
             pubkey: info.public_key().to_string(),
-            session_secret: None, // Not exposed in pubky-common SessionInfo
+            session_secret: None, // Never populate. Session secrets stay on the cookie.
             capabilities: caps_vec,
             created_at: info.created_at(),
-            expires_at: None, // Not exposed in pubky-common SessionInfo
+            expires_at: info.expires_at(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionDescriptor {
+    pub id: i32,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub capabilities: Vec<String>,
+}
+
+impl From<&pubky_common::session::SessionDescriptor> for FfiSessionDescriptor {
+    fn from(info: &pubky_common::session::SessionDescriptor) -> Self {
+        Self {
+            id: info.id(),
+            created_at: info.created_at(),
+            expires_at: info.expires_at(),
+            capabilities: info.capabilities().iter().map(|c| c.to_string()).collect(),
         }
     }
 }
@@ -50,4 +66,3 @@ pub struct FfiListItem {
 pub trait FfiKeyProvider: Send + Sync {
     fn secret_key(&self) -> Result<Vec<u8>, crate::ffi::errors::FfiPubkyError>;
 }
-

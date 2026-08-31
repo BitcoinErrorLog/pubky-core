@@ -1,10 +1,12 @@
 use pubky_common::auth::AuthToken;
+use pubky_common::session::SessionDescriptor;
 use reqwest::Method;
 use url::Url;
 
 use super::PubkySigner;
 use crate::{
-    Capabilities, Capability, PubkySession, PublicKey, Result, cross_log, util::check_http_status,
+    Capabilities, Capability, PubkySession, PublicKey, Result,
+    actors::storage::resource::resolve_pubky, cross_log, util::check_http_status,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -163,5 +165,79 @@ impl PubkySigner {
             self.keypair.public_key()
         );
         Ok(())
+    }
+
+    /// List this key's active homeserver sessions.
+    ///
+    /// Signs a fresh root-capability [`AuthToken`]. A session cookie is not accepted
+    /// by the homeserver for this call.
+    ///
+    /// The returned records never include session secrets.
+    ///
+    /// # Errors
+    /// - Propagates transport failures.
+    /// - Returns [`crate::errors::Error::Authentication`] or a server error if the
+    ///   homeserver rejects the owner proof.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionDescriptor>> {
+        let public_key = self.public_key();
+        cross_log!(info, "Listing sessions for {}", public_key);
+        let response = self
+            .send_owner_session_request(Method::POST, "/sessions")
+            .await?;
+        let response = check_http_status(response).await?;
+        response.json().await.map_err(Into::into)
+    }
+
+    /// Revoke one session by the id returned from [`PubkySigner::list_sessions`].
+    ///
+    /// Signs a fresh root-capability [`AuthToken`]. A stolen session cookie cannot
+    /// authorize this call.
+    ///
+    /// # Errors
+    /// - Propagates transport failures.
+    /// - Returns a server error if the session does not belong to this key.
+    pub async fn revoke_session(&self, session_id: i32) -> Result<()> {
+        let public_key = self.public_key();
+        cross_log!(info, "Revoking session {} for {}", session_id, public_key);
+        let path = format!("/sessions/{session_id}");
+        let response = self
+            .send_owner_session_request(Method::DELETE, &path)
+            .await?;
+        check_http_status(response).await?;
+        Ok(())
+    }
+
+    /// Revoke every session for this key, including any session currently in use.
+    ///
+    /// After this call the owner must sign in again. This is the safer default
+    /// versus keeping the caller's session alive.
+    ///
+    /// # Errors
+    /// - Propagates transport failures or homeserver rejection of the owner proof.
+    pub async fn revoke_all_sessions(&self) -> Result<()> {
+        let public_key = self.public_key();
+        cross_log!(info, "Revoking all sessions for {}", public_key);
+        let response = self
+            .send_owner_session_request(Method::DELETE, "/sessions")
+            .await?;
+        check_http_status(response).await?;
+        Ok(())
+    }
+
+    async fn send_owner_session_request(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<reqwest::Response> {
+        let token = self.root_capability_token();
+        let url = format!("pubky://{}{path}", self.public_key());
+        let resolved = resolve_pubky(&url)?;
+        self.client
+            .cross_request(method, resolved)
+            .await?
+            .body(token.serialize())
+            .send()
+            .await
+            .map_err(Into::into)
     }
 }

@@ -34,4 +34,20 @@ impl SessionInfo {
             .map(|c| c.to_string())
             .collect()
     }
+
+    /// Unix timestamp (seconds) when this session was created, if the homeserver provided one.
+    ///
+    /// @returns {bigint}
+    #[wasm_bindgen(js_name = "createdAt", getter)]
+    pub fn created_at(&self) -> u64 {
+        self.0.created_at()
+    }
+
+    /// Unix timestamp (seconds) when this session expires, or `undefined` if unknown.
+    ///
+    /// @returns {bigint|undefined}
+    #[wasm_bindgen(js_name = "expiresAt", getter)]
+    pub fn expires_at(&self) -> Option<u64> {
+        self.0.expires_at()
+    }
 }

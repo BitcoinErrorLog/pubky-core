@@ -75,5 +75,6 @@ pub use pubky_common::{
     auth::AuthToken,
     capabilities::{Capabilities, Capability},
     recovery_file,
+    session::{SessionDescriptor, SessionInfo},
 };
 pub use reqwest::{Method, StatusCode};

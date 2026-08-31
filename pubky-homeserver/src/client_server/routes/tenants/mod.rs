@@ -3,7 +3,11 @@
 //! Every route here is relative to a tenant's Pubky host,
 //! as opposed to routes relative to the Homeserver's owner.
 
-use axum::{extract::DefaultBodyLimit, routing::get, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{delete, get, post},
+    Router,
+};
 
 use crate::client_server::{layers::authz::AuthorizationLayer, AppState};
 
@@ -14,6 +18,11 @@ pub mod write;
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/session", get(session::session).delete(session::signout))
+        .route(
+            "/sessions",
+            post(session::list_sessions).delete(session::revoke_all_sessions),
+        )
+        .route("/sessions/{id}", delete(session::revoke_session))
         // XXX: dzdidi new path example:
         // https://qtnyghnq9swketdtj9drc7rs5pfnxhs61gq4jwd317ezdegcrbco/dav/qtnyghnq9swketdtj9drc7rs5pfnxhs61gq4jwd317ezdegcrbco/pub/test.txt
         // via https://github.com/pubky/pubky-core/pull/145#discussion_r2149297326

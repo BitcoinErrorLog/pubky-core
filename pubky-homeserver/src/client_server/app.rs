@@ -119,6 +119,7 @@ impl ClientServer {
             Some(quota_mb * 1024 * 1024)
         };
 
+        let session_ttl_secs = context.config_toml.general.resolved_session_ttl_secs();
         let state = AppState {
             verifier: AuthVerifier::default(),
             sql_db: context.sql_db.clone(),
@@ -127,6 +128,7 @@ impl ClientServer {
             user_quota_bytes: quota_bytes,
             metrics: context.metrics.clone(),
             events_service: context.events_service.clone(),
+            session_ttl: Duration::from_secs(session_ttl_secs),
         };
         super::create_app(state.clone(), context)
     }

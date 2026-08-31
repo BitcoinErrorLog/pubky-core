@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 
-use crate::ffi::errors::FfiPubkyError;
-use crate::ffi::types::FfiSessionInfo;
-use crate::ffi::storage::FfiSessionStorage;
 use crate::PubkySession as CoreSession;
+use crate::ffi::errors::FfiPubkyError;
+use crate::ffi::storage::FfiSessionStorage;
+use crate::ffi::types::FfiSessionInfo;
 use std::sync::Arc;
 
 #[derive(uniffi::Object)]
@@ -17,16 +17,18 @@ impl FfiPubkySession {
         let inner = self.inner.blocking_lock();
         FfiSessionInfo::from(inner.info())
     }
-    
+
     pub fn storage(&self) -> Arc<FfiSessionStorage> {
         Arc::new(FfiSessionStorage {
             session: self.inner.clone(),
         })
     }
-    
+
     pub async fn signout(&self) -> Result<(), FfiPubkyError> {
         let session = self.inner.lock().await.clone();
-        session.signout().await
+        session
+            .signout()
+            .await
             .map_err(|(e, _)| FfiPubkyError::from(e))?;
         Ok(())
     }
@@ -39,4 +41,3 @@ impl FfiPubkySession {
         })
     }
 }
-

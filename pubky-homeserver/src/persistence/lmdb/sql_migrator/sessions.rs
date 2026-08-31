@@ -2,12 +2,15 @@ use pubky_common::{capabilities::Capabilities, session::SessionInfo};
 use sea_query::{PostgresQueryBuilder, Query, SimpleExpr};
 use sea_query_binder::SqlxBinder;
 
-use crate::persistence::{
-    lmdb::{sql_migrator::users::nano_seconds_to_timestamp, LmDB},
-    sql::{
-        session::{SessionIden, SESSION_TABLE},
-        user::UserRepository,
-        UnifiedExecutor,
+use crate::{
+    data_directory::LEGACY_SESSION_TTL_SECS,
+    persistence::{
+        lmdb::{sql_migrator::users::nano_seconds_to_timestamp, LmDB},
+        sql::{
+            session::{SessionIden, SESSION_TABLE},
+            user::UserRepository,
+            UnifiedExecutor,
+        },
     },
 };
 
@@ -22,6 +25,11 @@ pub async fn create<'a>(
     let created_at =
         nano_seconds_to_timestamp(lmdb_session.created_at()).expect("Should always be valid");
     let created_at = created_at.naive_utc();
+    let expires_at = lmdb_session
+        .expires_at()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs as i64, 0))
+        .map(|dt| dt.naive_utc())
+        .unwrap_or_else(|| created_at + chrono::TimeDelta::seconds(LEGACY_SESSION_TTL_SECS as i64));
     let statement = Query::insert()
         .into_table(SESSION_TABLE)
         .columns([
@@ -29,6 +37,7 @@ pub async fn create<'a>(
             SessionIden::User,
             SessionIden::Capabilities,
             SessionIden::CreatedAt,
+            SessionIden::ExpiresAt,
         ])
         .values(vec![
             SimpleExpr::Value(session_secret.into()),
@@ -39,6 +48,7 @@ pub async fn create<'a>(
                     .into(),
             ),
             SimpleExpr::Value(created_at.into()),
+            SimpleExpr::Value(expires_at.into()),
         ])
         .expect("Failed to build insert statement")
         .to_owned();

@@ -19,7 +19,6 @@ use axum_extra::extract::Host;
 use bytes::Bytes;
 use pkarr::PublicKey;
 use pubky_common::capabilities::Capabilities;
-use pubky_common::session::SessionInfo;
 use std::collections::HashMap;
 use tower_cookies::{
     cookie::time::{Duration, OffsetDateTime},
@@ -133,20 +132,27 @@ async fn create_session_and_cookie(
     user: &UserEntity,
     capabilities: &Capabilities,
 ) -> HttpResult<impl IntoResponse> {
-    let session_secret =
-        SessionRepository::create(user.id, capabilities, &mut state.sql_db.pool().into()).await?;
+    let ttl_secs = i64::try_from(state.session_ttl.as_secs()).unwrap_or(i64::MAX);
+    let expires_at = chrono::Utc::now().naive_utc() + chrono::TimeDelta::seconds(ttl_secs);
+    let session_secret = SessionRepository::create(
+        user.id,
+        capabilities,
+        expires_at,
+        &mut state.sql_db.pool().into(),
+    )
+    .await?;
+    let session =
+        SessionRepository::get_by_secret(&session_secret, &mut state.sql_db.pool().into()).await?;
 
-    // 3) Build and set cookie
     let mut cookie = Cookie::new(user.public_key.to_string(), session_secret.to_string());
     configure_session_cookie(&mut cookie, host);
-    // Set the cookie to expire in one year.
-    let one_year = Duration::days(365);
-    let expiry = OffsetDateTime::now_utc() + one_year;
-    cookie.set_max_age(one_year);
+    let cookie_ttl = Duration::seconds(ttl_secs);
+    let expiry = OffsetDateTime::now_utc() + cookie_ttl;
+    cookie.set_max_age(cookie_ttl);
     cookie.set_expires(expiry);
     cookies.add(cookie);
 
-    let session = SessionInfo::new(&user.public_key, capabilities.clone(), None);
+    let session = session.to_session_info();
     let mut resp = session.serialize().into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,

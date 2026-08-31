@@ -2,7 +2,7 @@ use wasm_bindgen::prelude::*;
 
 use super::{pkdns::Pkdns, session::Session};
 use crate::js_error::JsResult;
-use crate::wrappers::{keys::Keypair, keys::PublicKey};
+use crate::wrappers::{keys::Keypair, keys::PublicKey, session_descriptor::SessionDescriptor};
 
 /// Holds a user’s `Keypair` and performs identity operations:
 /// - `signup` creates a new homeserver user.
@@ -94,5 +94,35 @@ impl Signer {
     #[wasm_bindgen(getter)]
     pub fn pkdns(&self) -> Pkdns {
         Pkdns(self.0.pkdns())
+    }
+
+    /// List this key's active homeserver sessions. Never includes session secrets.
+    ///
+    /// Signs a fresh root AuthToken; a stolen cookie cannot authorize this.
+    ///
+    /// @returns {Promise<SessionDescriptor[]>}
+    #[wasm_bindgen(js_name = "listSessions")]
+    pub async fn list_sessions(&self) -> JsResult<Vec<SessionDescriptor>> {
+        let sessions = self.0.list_sessions().await?;
+        Ok(sessions.into_iter().map(SessionDescriptor::from).collect())
+    }
+
+    /// Revoke one session by id from `listSessions()`.
+    ///
+    /// @param {number} sessionId
+    /// @returns {Promise<void>}
+    #[wasm_bindgen(js_name = "revokeSession")]
+    pub async fn revoke_session(&self, session_id: i32) -> JsResult<()> {
+        self.0.revoke_session(session_id).await?;
+        Ok(())
+    }
+
+    /// Revoke every session for this key, including any currently in use.
+    ///
+    /// @returns {Promise<void>}
+    #[wasm_bindgen(js_name = "revokeAllSessions")]
+    pub async fn revoke_all_sessions(&self) -> JsResult<()> {
+        self.0.revoke_all_sessions().await?;
+        Ok(())
     }
 }

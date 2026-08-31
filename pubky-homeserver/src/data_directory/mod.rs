@@ -12,7 +12,10 @@ mod signup_mode;
 pub mod storage_config;
 
 mod log_level;
-pub use config_toml::{AdminToml, ConfigReadError, ConfigToml, LoggingToml, MetricsToml};
+pub use config_toml::{
+    AdminToml, ConfigReadError, ConfigToml, LoggingToml, MetricsToml, DEFAULT_SESSION_TTL_SECS,
+    LEGACY_SESSION_TTL_SECS,
+};
 pub use data_dir::DataDir;
 pub use domain::Domain;
 pub use domain_port::DomainPort;

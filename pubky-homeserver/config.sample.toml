@@ -13,6 +13,11 @@ signup_mode = "token_required"
 # Set it to 0 for unlimited.
 user_storage_quota_mb = 0
 
+# Lifetime of newly created sessions, in seconds. The session cookie max-age
+# matches this value. 0 is treated as the default (2592000 = 30 days).
+# Existing sessions keep the lifetime they were issued (365 days).
+session_ttl_seconds = 2592000
+
 [drive]
 # The port number to run an HTTPS (Pkarr TLS) server on.
 # Pkarr TLS is a TLS implementation that is compatible with the Pkarr protocol.

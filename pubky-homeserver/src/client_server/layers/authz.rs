@@ -106,8 +106,9 @@ async fn authorize(
     public_key: &PublicKey,
     path: &str,
 ) -> HttpResult<()> {
-    if path == "/session" {
-        // Checking (or deleting) one's session is ok for everyone
+    if is_session_management_path(method, path) {
+        // /session is cookie-holder signout / inspect.
+        // /sessions* is owner-proof (AuthToken) list/revoke — authorized in the handler.
         return Ok(());
     } else if path.starts_with("/pub/") {
         if method == Method::GET || method == Method::HEAD {
@@ -148,11 +149,7 @@ async fn authorize(
         {
             Ok(session) => session,
             Err(sqlx::Error::RowNotFound) => {
-                tracing::warn!(
-                    "No session found in the database for session secret: {}, pubky: {}",
-                    session_secret,
-                    public_key
-                );
+                tracing::warn!("No valid session found for pubky {}", public_key);
                 return Err(HttpError::unauthorized_with_message(
                     "No session found for session secret",
                 ));
@@ -180,8 +177,7 @@ async fn authorize(
         Ok(())
     } else {
         tracing::warn!(
-            "SessionInfo {} pubkey {} does not have write access to {}. Access forbidden",
-            session_secret,
+            "Session for pubkey {} does not have write access to {}. Access forbidden",
             public_key,
             path
         );
@@ -201,4 +197,50 @@ pub fn session_secret_from_cookies(
         .get(&public_key.to_string())
         .map(|c| c.value().to_string())?;
     SessionSecret::new(value).ok()
+}
+
+/// Method+path pairs that skip cookie capability checks.
+///
+/// Only the verbs that have dedicated session handlers are exempt.
+/// Any other method on these paths falls through and is forbidden
+/// (they are not `/pub/` writes).
+fn is_session_management_path(method: &Method, path: &str) -> bool {
+    match (method, path) {
+        (&Method::GET | &Method::DELETE, "/session") => true,
+        (&Method::POST | &Method::DELETE, "/sessions") => true,
+        (&Method::DELETE, p) if is_numeric_session_path(p) => true,
+        _ => false,
+    }
+}
+
+fn is_numeric_session_path(path: &str) -> bool {
+    path.strip_prefix("/sessions/")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_management_paths_are_method_tight() {
+        assert!(is_session_management_path(&Method::GET, "/session"));
+        assert!(is_session_management_path(&Method::DELETE, "/session"));
+        assert!(is_session_management_path(&Method::POST, "/sessions"));
+        assert!(is_session_management_path(&Method::DELETE, "/sessions"));
+        assert!(is_session_management_path(&Method::DELETE, "/sessions/42"));
+        assert!(!is_session_management_path(&Method::PUT, "/sessions"));
+        assert!(!is_session_management_path(&Method::PUT, "/sessions/42"));
+        assert!(!is_session_management_path(&Method::GET, "/sessions"));
+        assert!(!is_session_management_path(&Method::DELETE, "/sessions/"));
+        assert!(!is_session_management_path(
+            &Method::DELETE,
+            "/sessions/abc"
+        ));
+        assert!(!is_session_management_path(
+            &Method::DELETE,
+            "/sessions/1/extra"
+        ));
+        assert!(!is_session_management_path(&Method::GET, "/pub/file"));
+    }
 }

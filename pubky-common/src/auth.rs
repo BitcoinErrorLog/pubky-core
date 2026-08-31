@@ -18,6 +18,11 @@ const CURRENT_VERSION: u8 = 0;
 // 45 seconds in the past or the future
 const TIMESTAMP_WINDOW: i64 = 45 * 1_000_000;
 
+/// Minimum bytes for a v0 token: version lives at index 75, and
+/// [`AuthToken::id`] reads `bytes[75..115]`. Shorter input is rejected
+/// before any index so callers cannot panic the verifier.
+pub const AUTH_TOKEN_MIN_LEN: usize = 115;
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 /// Implementation of the [Pubky Auth spec](https://pubky.github.io/pubky-core/spec/auth.html).
 pub struct AuthToken {
@@ -78,6 +83,9 @@ impl AuthToken {
 
     /// Parse and verify an AuthToken.
     pub fn verify(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < AUTH_TOKEN_MIN_LEN {
+            return Err(Error::TooShort);
+        }
         if bytes[75] > CURRENT_VERSION {
             return Err(Error::UnknownVersion);
         }
@@ -183,6 +191,9 @@ impl AuthVerifier {
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 /// Error verifying an [AuthToken]
 pub enum Error {
+    #[error("AuthToken is shorter than {AUTH_TOKEN_MIN_LEN} bytes")]
+    /// AuthToken is too short to be a valid v0 token
+    TooShort,
     #[error("Unknown version")]
     /// Unknown version
     UnknownVersion,
@@ -277,6 +288,20 @@ mod tests {
         let result = verifier.verify(&serialized);
 
         assert_eq!(result, Err(Error::Expired));
+    }
+
+    #[test]
+    fn too_short_is_rejected() {
+        assert_eq!(AuthToken::verify(&[]), Err(Error::TooShort));
+        assert_eq!(AuthToken::verify(&[0u8; 75]), Err(Error::TooShort));
+        assert_eq!(
+            AuthToken::verify(&[0u8; AUTH_TOKEN_MIN_LEN - 1]),
+            Err(Error::TooShort)
+        );
+        assert_eq!(
+            AuthVerifier::default().verify(&[0u8; 10]),
+            Err(Error::TooShort)
+        );
     }
 
     #[test]
