@@ -11,12 +11,20 @@ another. The identity public key does not change.
      This recovery is required because the homeserver creates the user
      *before* the client publishes `_pubky`. A failed first publish must not
      become a dead end.
-2. Force-publishes `_pubky` to the new homeserver public key (CAS retries
-   re-resolve the latest signed packet so a stale timestamp cannot loop).
+2. Force-publishes `_pubky` to the new homeserver public key. CAS retries
+   restore the previous packet in the pkarr cache, re-resolve the latest
+   signed packet, and (on the last force attempt) omit If-Match so a
+   phantom cache entry cannot loop forever.
 
 Sign-in during recovery targets `https://<new-homeserver>/session`. It does
 **not** follow the current `_pubky` record, which may still point at the
-previous host.
+previous host. The hydrated session's public key is checked against the
+signing identity.
+
+On native, the session cookie is keyed by user pubkey only, not by the
+issuing host. After a move, stale Pubky TLS routing can send the new
+host's cookie to the old host until the packet cache expires. WASM
+cookies are origin-scoped and are not affected.
 
 ## What it does not do
 

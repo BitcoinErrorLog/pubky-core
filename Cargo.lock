@@ -3788,6 +3788,7 @@ dependencies = [
  "hex",
  "httpdate",
  "httpmock",
+ "js-sys",
  "log",
  "pkarr",
  "pubky-common",
@@ -3801,6 +3802,7 @@ dependencies = [
  "uniffi",
  "uniffi_bindgen",
  "url",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
 ]
