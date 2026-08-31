@@ -56,22 +56,18 @@ pub fn derive_x25519_for_device_epoch(
         });
     }
 
-    let device_id_bytes =
-        hex::decode(&device_id_hex).map_err(|e| FfiPubkyError::InvalidInput {
-            message: format!("Invalid hex for device ID: {e}"),
-        })?;
+    let device_id_bytes = hex::decode(&device_id_hex).map_err(|e| FfiPubkyError::InvalidInput {
+        message: format!("Invalid hex for device ID: {e}"),
+    })?;
 
     let mut seed_array = [0u8; 32];
     seed_array.copy_from_slice(&seed_bytes);
 
-    let secret_key = pubky_noise::kdf::derive_x25519_for_device_epoch(
-        &seed_array,
-        &device_id_bytes,
-        epoch,
-    )
-    .map_err(|e| FfiPubkyError::Unknown {
-        message: format!("Key derivation failed: {e}"),
-    })?;
+    let secret_key =
+        pubky_noise::kdf::derive_x25519_for_device_epoch(&seed_array, &device_id_bytes, epoch)
+            .map_err(|e| FfiPubkyError::Unknown {
+                message: format!("Key derivation failed: {e}"),
+            })?;
 
     let public_key = pubky_noise::x25519_public_from_secret(&secret_key);
 
@@ -94,23 +90,26 @@ pub fn derive_noise_seed(
 
     if secret_bytes.len() != 32 {
         return Err(FfiPubkyError::InvalidInput {
-            message: format!("Ed25519 secret must be 32 bytes, got {}", secret_bytes.len()),
+            message: format!(
+                "Ed25519 secret must be 32 bytes, got {}",
+                secret_bytes.len()
+            ),
         });
     }
 
-    let device_id_bytes =
-        hex::decode(&device_id_hex).map_err(|e| FfiPubkyError::InvalidInput {
-            message: format!("Invalid hex for device ID: {e}"),
-        })?;
+    let device_id_bytes = hex::decode(&device_id_hex).map_err(|e| FfiPubkyError::InvalidInput {
+        message: format!("Invalid hex for device ID: {e}"),
+    })?;
 
     let mut secret_array = [0u8; 32];
     secret_array.copy_from_slice(&secret_bytes);
 
-    let seed = pubky_noise::kdf::derive_noise_seed(&secret_array, &device_id_bytes).map_err(
-        |e| FfiPubkyError::Unknown {
-            message: format!("Noise seed derivation failed: {e}"),
-        },
-    )?;
+    let seed =
+        pubky_noise::kdf::derive_noise_seed(&secret_array, &device_id_bytes).map_err(|e| {
+            FfiPubkyError::Unknown {
+                message: format!("Noise seed derivation failed: {e}"),
+            }
+        })?;
 
     Ok(hex::encode(seed))
 }
@@ -137,10 +136,9 @@ pub fn sealed_blob_encrypt(
         });
     }
 
-    let plaintext_bytes =
-        hex::decode(&plaintext_hex).map_err(|e| FfiPubkyError::InvalidInput {
-            message: format!("Invalid hex for plaintext: {e}"),
-        })?;
+    let plaintext_bytes = hex::decode(&plaintext_hex).map_err(|e| FfiPubkyError::InvalidInput {
+        message: format!("Invalid hex for plaintext: {e}"),
+    })?;
 
     let mut recipient_pk_array = [0u8; 32];
     recipient_pk_array.copy_from_slice(&recipient_pk_bytes);
@@ -182,12 +180,10 @@ pub fn sealed_blob_decrypt(
     let mut recipient_sk_array = [0u8; 32];
     recipient_sk_array.copy_from_slice(&recipient_sk_bytes);
 
-    let plaintext =
-        pubky_noise::sealed_blob_decrypt(&recipient_sk_array, &envelope_json, &aad).map_err(
-            |e| FfiPubkyError::Unknown {
-                message: format!("Sealed blob decryption failed: {e}"),
-            },
-        )?;
+    let plaintext = pubky_noise::sealed_blob_decrypt(&recipient_sk_array, &envelope_json, &aad)
+        .map_err(|e| FfiPubkyError::Unknown {
+            message: format!("Sealed blob decryption failed: {e}"),
+        })?;
 
     Ok(hex::encode(plaintext))
 }
@@ -211,7 +207,10 @@ pub fn ed25519_sign(
 
     if secret_bytes.len() != 32 {
         return Err(FfiPubkyError::InvalidInput {
-            message: format!("Ed25519 secret must be 32 bytes, got {}", secret_bytes.len()),
+            message: format!(
+                "Ed25519 secret must be 32 bytes, got {}",
+                secret_bytes.len()
+            ),
         });
     }
 
@@ -256,10 +255,9 @@ pub fn ed25519_verify(
         message: format!("Invalid hex for message: {e}"),
     })?;
 
-    let signature_bytes =
-        hex::decode(&signature_hex).map_err(|e| FfiPubkyError::InvalidInput {
-            message: format!("Invalid hex for signature: {e}"),
-        })?;
+    let signature_bytes = hex::decode(&signature_hex).map_err(|e| FfiPubkyError::InvalidInput {
+        message: format!("Invalid hex for signature: {e}"),
+    })?;
 
     if signature_bytes.len() != 64 {
         return Err(FfiPubkyError::InvalidInput {
@@ -273,13 +271,9 @@ pub fn ed25519_verify(
     let mut signature_array = [0u8; 64];
     signature_array.copy_from_slice(&signature_bytes);
 
-    let is_valid =
-        pubky_noise::ed25519_verify(&public_array, &message_bytes, &signature_array).map_err(
-            |e| FfiPubkyError::Unknown {
-                message: format!("Ed25519 verification failed: {e}"),
-            },
-        )?;
-
-    Ok(is_valid)
+    Ok(pubky_noise::ed25519_verify(
+        &public_array,
+        &message_bytes,
+        &signature_array,
+    ))
 }
-

@@ -4,8 +4,8 @@ use pubky_testnet::pubky::{
 };
 use pubky_testnet::pubky_common::capabilities::{Capabilities, Capability};
 use pubky_testnet::{
-    pubky_homeserver::{MockDataDir, SignupMode},
     EphemeralTestnet, Testnet,
+    pubky_homeserver::{MockDataDir, SignupMode},
 };
 use std::str::FromStr;
 use std::time::Duration;
@@ -612,4 +612,62 @@ async fn test_republish_homeserver() {
         .as_u64();
 
     assert!(ts3 > ts2, "record should be republished when stale");
+}
+
+#[tokio::test]
+#[pubky_testnet::test]
+async fn migrate_homeserver_republishes_pubky_and_does_not_copy_data() {
+    let mut testnet = Testnet::new().await.unwrap();
+    let pubky = testnet.sdk().unwrap();
+
+    let hs_a = testnet.create_homeserver().await.unwrap().public_key();
+    let hs_b = testnet
+        .create_random_homeserver()
+        .await
+        .unwrap()
+        .public_key();
+    assert_ne!(hs_a, hs_b);
+
+    let signer = pubky.signer(Keypair::random());
+    let session_a = signer.signup(&hs_a, None).await.unwrap();
+    session_a
+        .storage()
+        .put(
+            "/pub/migration-proof/only-on-a.txt",
+            b"stays-on-a".as_slice(),
+        )
+        .await
+        .unwrap();
+
+    let resolved_before = signer.pkdns().get_homeserver().await.unwrap();
+    assert_eq!(resolved_before.as_ref(), Some(&hs_a));
+
+    let session_b = signer.migrate_homeserver(&hs_b, None).await.unwrap();
+    assert_eq!(session_b.info().public_key(), session_a.info().public_key());
+
+    let resolved_after = signer.pkdns().get_homeserver().await.unwrap();
+    assert_eq!(resolved_after.as_ref(), Some(&hs_b));
+
+    // Native Pubky TLS may still route `https://<user>/…` to the first
+    // homeserver until the pkarr cache expires, so session_b storage is
+    // not a reliable isolation probe. The old session must still read
+    // the file that was written before the move.
+    let still_on_a = session_a
+        .storage()
+        .get("/pub/migration-proof/only-on-a.txt")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(still_on_a, "stays-on-a");
+
+    // Second migrate is the 409 path: user already exists on B.
+    let session_b_again = signer.migrate_homeserver(&hs_b, None).await.unwrap();
+    assert_eq!(
+        session_b_again.info().public_key(),
+        session_a.info().public_key()
+    );
+    let still_b = signer.pkdns().get_homeserver().await.unwrap();
+    assert_eq!(still_b.as_ref(), Some(&hs_b));
 }

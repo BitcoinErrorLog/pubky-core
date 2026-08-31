@@ -1,5 +1,6 @@
 //! HTTP methods that support `https://` with Pkarr domains, including `_pubky.<pk>` URLs
 
+use super::browser::{BrowserEndpointRank, rank_browser_endpoint, rewrite_url_for_browser};
 use crate::errors::{PkarrError, Result};
 use crate::{PubkyHttpClient, cross_log};
 use futures_lite::StreamExt;
@@ -104,55 +105,44 @@ impl PubkyHttpClient {
     where
         S: futures_lite::Stream<Item = Endpoint> + Unpin,
     {
+        let mut best: Option<(BrowserEndpointRank, Endpoint)> = None;
         while let Some(endpoint) = stream.next().await {
-            if endpoint.domain().is_some() {
+            let rank = rank_browser_endpoint(endpoint.domain(), endpoint_has_http_port(&endpoint));
+            if rank == BrowserEndpointRank::Unreachable {
+                continue;
+            }
+            if rank == BrowserEndpointRank::BrowserHttp {
                 return Some(endpoint);
+            }
+            if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+                best = Some((rank, endpoint));
             }
         }
 
-        None
+        best.map(|(_, endpoint)| endpoint)
     }
 
     fn apply_endpoint_to_url(&self, url: &mut Url, endpoint: &Endpoint) -> Result<()> {
-        let is_testnet_domain = endpoint.domain().is_some_and(|domain| {
-            if domain == "localhost" {
-                return true;
-            }
-            if let Some(test_host) = &self.testnet_host {
-                return domain == test_host;
-            }
-            false
-        });
-
-        if is_testnet_domain {
-            url.set_scheme("http")
-                .map_err(|_err| url::ParseError::RelativeUrlWithCannotBeABaseBase)?;
-
-            let http_port = endpoint
-                .get_param(pubky_common::constants::reserved_param_keys::HTTP_PORT)
-                .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-                .map(u16::from_be_bytes)
-                .ok_or_else(|| {
-                    PkarrError::InvalidRecord(
-                        "Pkarr record missing required HTTP_PORT parameter for testnet endpoint"
-                            .to_string(),
-                    )
-                })?;
-
-            url.set_port(Some(http_port))
-                .map_err(|_err| url::ParseError::InvalidPort)?;
-        } else if let Some(port) = endpoint.port() {
-            url.set_port(Some(port))
-                .map_err(|_err| url::ParseError::InvalidPort)?;
-        }
-
-        if let Some(domain) = endpoint.domain() {
-            url.set_host(Some(domain))
-                .map_err(|_err| url::ParseError::SetHostOnCannotBeABaseUrl)?;
-        }
-
-        Ok(())
+        let domain = endpoint.domain().ok_or_else(|| {
+            PkarrError::InvalidRecord(
+                "WASM client cannot use a Pubky TLS endpoint (no ICANN/HTTP domain)".to_string(),
+            )
+        })?;
+        rewrite_url_for_browser(url, domain, endpoint_http_port(endpoint), endpoint.port())
     }
+}
+
+fn endpoint_has_http_port(endpoint: &Endpoint) -> bool {
+    endpoint
+        .get_param(pubky_common::constants::reserved_param_keys::HTTP_PORT)
+        .is_some()
+}
+
+fn endpoint_http_port(endpoint: &Endpoint) -> Option<u16> {
+    endpoint
+        .get_param(pubky_common::constants::reserved_param_keys::HTTP_PORT)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_be_bytes)
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

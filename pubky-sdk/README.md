@@ -54,6 +54,10 @@ signer.pkdns().publish_homeserver_if_stale(None).await?;
 let resolved = signer.pkdns().get_homeserver().await;
 println!("Your current homeserver: {:?}", resolved);
 
+// 7) Move the mailbox pointer to another homeserver. Host-local data is
+//    not copied; see docs/HOMESERVER_MIGRATION.md.
+// signer.migrate_homeserver(&other_homeserver, signup_token).await?;
+
 # Ok(()) }
 ```
 
@@ -64,7 +68,7 @@ Use a shared `Pubky` (via cloning it, passing down as argument or behind `OnceCe
 ## Mental model
 
 - `Pubky` - facade, always start here! Owns the transport and constructs actors.
-- `PubkySigner` - local key holder. Can `signup`, `signin`, approve QR auth, publish PKDNS.
+- `PubkySigner` - local key holder. Can `signup`, `signin`, `migrate_homeserver`, approve QR auth, publish PKDNS.
 - `PubkySession` - authenticated “as me” handle. Exposes session-scoped storage.
 - `PublicStorage` - unauthenticated reads of others’ public data.
 - `Pkdns` - resolve/publish `_pubky` records.

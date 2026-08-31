@@ -7,6 +7,7 @@ use crate::wrappers::{keys::Keypair, keys::PublicKey};
 /// Holds a user’s `Keypair` and performs identity operations:
 /// - `signup` creates a new homeserver user.
 /// - `signin` creates a homeserver session for an existing user.
+/// - `migrateHomeserver` moves the `_pubky` mailbox pointer (does not copy data).
 /// - Approve pubkyauth requests
 /// - Publish PKDNS when signer-bound
 #[wasm_bindgen]
@@ -52,6 +53,27 @@ impl Signer {
         let session = self
             .0
             .signup(homeserver.as_inner(), signup_token.as_deref())
+            .await?;
+        Ok(Session(session))
+    }
+
+    /// Move this identity to `homeserver` and republish `_pubky`.
+    ///
+    /// Signs up, or signs in on that host if the user already exists (HTTP 409).
+    /// Host-local data is not copied from the previous homeserver.
+    ///
+    /// @param {PublicKey} homeserver
+    /// @param {string|null} signupToken
+    /// @returns {Promise<Session>}
+    #[wasm_bindgen(js_name = "migrateHomeserver")]
+    pub async fn migrate_homeserver(
+        &self,
+        homeserver: &PublicKey,
+        signup_token: Option<String>,
+    ) -> JsResult<Session> {
+        let session = self
+            .0
+            .migrate_homeserver(homeserver.as_inner(), signup_token.as_deref())
             .await?;
         Ok(Session(session))
     }
