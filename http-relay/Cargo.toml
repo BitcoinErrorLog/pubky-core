@@ -16,6 +16,7 @@ axum = "0.8.6"
 axum-server = "0.7.2"
 base64 = "0.22.1"
 futures-util = "0.3.31"
+ipnet = "2.11"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11.2"

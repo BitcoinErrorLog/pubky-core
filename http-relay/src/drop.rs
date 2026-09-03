@@ -4,7 +4,15 @@
 //! direction, purpose and epoch. This relay only ever sees the opaque id and
 //! opaque ciphertext bodies; authenticity lives inside the payloads (SB2),
 //! never at this layer. Everything keyed by remote input (channels, messages,
-//! rate-limit entries) is bounded; see [`DropConfig`] for the bounds.
+//! rate-limit entries) is bounded; see [`DropConfig`] for the bounds. Stored
+//! bytes are bounded globally by [`DropConfig::max_total_bytes`]: when a
+//! `PUT` would exceed that budget, expired channels are purged first, then
+//! least-recently-used channels are evicted until the message fits, and a
+//! message that still cannot fit is rejected with `507 Insufficient Storage`.
+//!
+//! `GET` responses are deterministic CBOR (see the schema documented on
+//! [`DropMessage`]), and client-IP rate limiting only honors
+//! `X-Forwarded-For` from [`DropConfig::trusted_proxies`].
 //!
 //! Channel ids are never logged above `debug` level.
 
@@ -28,6 +36,7 @@ use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::http_relay::AppState;
@@ -40,6 +49,8 @@ pub const DEFAULT_MAX_MESSAGES_PER_CHANNEL: usize = 64;
 pub const DEFAULT_MAX_BYTES_PER_CHANNEL: usize = 4 * 1024 * 1024;
 /// Default maximum number of channels held globally before LRU eviction (S8).
 pub const DEFAULT_MAX_CHANNELS: usize = 100_000;
+/// Default maximum total body bytes held across all channels: 256 MiB.
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 /// Default maximum size of a single drop message body: 64 KiB (S8).
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 /// Default maximum number of messages returned by a single poll (S8).
@@ -69,6 +80,21 @@ pub struct DropConfig {
     /// Maximum number of channels held globally; least-recently-used channels
     /// are evicted beyond this.
     pub max_channels: usize,
+    /// Maximum total message body bytes held across all channels globally.
+    ///
+    /// When a `PUT` would exceed this budget, expired channels are purged
+    /// first, then least-recently-used channels are evicted until the message
+    /// fits; a single message that still cannot fit is rejected with
+    /// [`DropError::StorageExhausted`] (`507 Insufficient Storage`).
+    pub max_total_bytes: usize,
+    /// Proxy addresses (individual IPs or CIDR ranges) whose
+    /// `X-Forwarded-For` headers are trusted for rate limiting.
+    ///
+    /// The header is honored (rightmost untrusted hop) only when the
+    /// immediate peer address is contained in one of these networks; from any
+    /// other peer the spoofable header is ignored. Default: empty (trust
+    /// nobody).
+    pub trusted_proxies: Vec<IpNet>,
     /// Maximum size of a single message body in bytes.
     pub max_body_bytes: usize,
     /// Maximum number of messages returned by a single `GET` poll.
@@ -89,6 +115,8 @@ impl Default for DropConfig {
             max_messages_per_channel: DEFAULT_MAX_MESSAGES_PER_CHANNEL,
             max_bytes_per_channel: DEFAULT_MAX_BYTES_PER_CHANNEL,
             max_channels: DEFAULT_MAX_CHANNELS,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            trusted_proxies: Vec::new(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_get_limit: DEFAULT_MAX_GET_LIMIT,
             write_rate_limit: DEFAULT_WRITE_RATE_LIMIT,
@@ -146,6 +174,16 @@ pub enum DropError {
         /// The configured maximum total body bytes per channel.
         max: usize,
     },
+    /// Storing the message would exceed the configured global byte budget,
+    /// even after purging expired channels and evicting least-recently-used
+    /// channels.
+    StorageExhausted {
+        /// The configured maximum total body bytes across all channels.
+        max: usize,
+    },
+    /// The channel's cursor space (`u64`) is exhausted; no further messages
+    /// can be appended without reusing a cursor.
+    CursorExhausted,
     /// The per-IP write rate limit was exceeded.
     RateLimited,
     /// No message with the given cursor exists on the channel.
@@ -167,6 +205,10 @@ impl fmt::Display for DropError {
             DropError::ChannelByteLimit { max } => {
                 write!(f, "channel byte budget of {max} bytes would be exceeded")
             }
+            DropError::StorageExhausted { max } => {
+                write!(f, "global byte budget of {max} bytes is exhausted")
+            }
+            DropError::CursorExhausted => write!(f, "channel cursor space is exhausted"),
             DropError::RateLimited => write!(f, "per-IP write rate limit exceeded"),
             DropError::MessageNotFound => write!(f, "message not found"),
         }
@@ -176,15 +218,39 @@ impl fmt::Display for DropError {
 impl std::error::Error for DropError {}
 
 /// A single stored drop message.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+///
+/// Wire schema for `GET /drop/{channel}` responses (deterministic CBOR): the
+/// response is a definite-length CBOR array of items, and each item is a
+/// definite-length CBOR map with exactly three integer keys in ascending
+/// order:
+///
+/// | Key | Value  | CBOR type        |
+/// |-----|--------|------------------|
+/// | `0` | cursor | unsigned integer |
+/// | `1` | ts     | unsigned integer (unix seconds) |
+/// | `2` | body   | byte string      |
+///
+/// Integers use shortest-form encoding and all lengths are definite, so the
+/// encoding of any given message list is unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropMessage {
     /// Per-channel, strictly monotonically increasing cursor.
     pub cursor: u64,
     /// Unix timestamp (seconds) at which the relay accepted the message.
     pub ts: u64,
     /// Opaque message body (ciphertext as far as the relay is concerned).
-    #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
+}
+
+impl serde::Serialize for DropMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry(&0u8, &self.cursor)?;
+        map.serialize_entry(&1u8, &self.ts)?;
+        map.serialize_entry(&2u8, &serde_bytes::Bytes::new(&self.body))?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -215,6 +281,10 @@ pub struct DropStore {
     rate_limits: HashMap<IpAddr, RateEntry>,
     /// Approximate LRU order for rate-limit entries.
     rate_lru: VecDeque<(IpAddr, u64)>,
+    /// Total message body bytes currently held across all channels; tracked
+    /// precisely on insert, delete, purge and eviction, and never exceeds
+    /// `DropConfig::max_total_bytes`.
+    total_bytes: usize,
     tick: u64,
 }
 
@@ -227,6 +297,7 @@ impl DropStore {
             channel_lru: VecDeque::new(),
             rate_limits: HashMap::new(),
             rate_lru: VecDeque::new(),
+            total_bytes: 0,
             tick: 0,
         }
     }
@@ -234,9 +305,14 @@ impl DropStore {
     /// Appends a message to a channel and returns its cursor.
     ///
     /// Enforces the per-message size limit, the per-channel message count and
-    /// byte budgets, and the global channel bound (evicting the
-    /// least-recently-used channel when full). Expired messages are purged
-    /// lazily before the limits are checked.
+    /// byte budgets, the global channel bound, and the global byte budget
+    /// (`DropConfig::max_total_bytes`). For the global byte budget, expired
+    /// channels are purged first, then least-recently-used channels are
+    /// evicted until the message fits; a single message that still cannot fit
+    /// is rejected with [`DropError::StorageExhausted`]. Once the store is
+    /// more than half full, every `PUT` first runs a cheap sweep that purges
+    /// expired messages from all channels. Expired messages on the target
+    /// channel are always purged before the per-channel limits are checked.
     pub fn append(
         &mut self,
         id: ChannelId,
@@ -249,6 +325,28 @@ impl DropStore {
             });
         }
 
+        let now_secs = unix_secs(now);
+
+        // Cheap TTL sweep once the store is more than half full, so expired
+        // data is reclaimed before LRU eviction has to destroy live channels.
+        if self.total_bytes > self.config.max_total_bytes / 2 {
+            self.purge_expired_channels(now_secs);
+        }
+
+        // Global byte budget: purge expired channels first, then evict
+        // least-recently-used channels until the message fits.
+        if !self.fits_within_global_cap(body.len()) {
+            self.purge_expired_channels(now_secs);
+            while !self.fits_within_global_cap(body.len())
+                && self.evict_least_recently_used_channel()
+            {}
+            if !self.fits_within_global_cap(body.len()) {
+                return Err(DropError::StorageExhausted {
+                    max: self.config.max_total_bytes,
+                });
+            }
+        }
+
         if !self.channels.contains_key(&id) {
             if self.channels.len() >= self.config.max_channels {
                 self.evict_channels_to(self.config.max_channels.saturating_sub(1));
@@ -256,9 +354,8 @@ impl DropStore {
             self.channels.insert(id, ChannelEntry::default());
         }
         self.touch_channel(&id);
+        self.purge_channel(&id, now_secs);
 
-        let now_secs = unix_secs(now);
-        let ttl_secs = self.config.message_ttl.as_secs();
         let max_messages = self.config.max_messages_per_channel;
         let max_bytes = self.config.max_bytes_per_channel;
 
@@ -266,7 +363,6 @@ impl DropStore {
             .channels
             .get_mut(&id)
             .expect("channel inserted immediately above");
-        purge_expired(entry, now_secs, ttl_secs);
 
         if entry.messages.len() >= max_messages {
             return Err(DropError::ChannelMessageLimit { max: max_messages });
@@ -276,13 +372,15 @@ impl DropStore {
         }
 
         let cursor = entry.next_cursor;
-        entry.next_cursor = entry.next_cursor.wrapping_add(1);
-        entry.total_bytes += body.len();
+        entry.next_cursor = cursor.checked_add(1).ok_or(DropError::CursorExhausted)?;
+        let body_len = body.len();
+        entry.total_bytes += body_len;
         entry.messages.push_back(DropMessage {
             cursor,
             ts: now_secs,
             body,
         });
+        self.total_bytes += body_len;
 
         Ok(cursor)
     }
@@ -302,14 +400,11 @@ impl DropStore {
         now: SystemTime,
     ) -> Vec<DropMessage> {
         self.touch_channel(id);
+        self.purge_channel(id, unix_secs(now));
 
-        let now_secs = unix_secs(now);
-        let ttl_secs = self.config.message_ttl.as_secs();
-        let Some(entry) = self.channels.get_mut(id) else {
+        let Some(entry) = self.channels.get(id) else {
             return Vec::new();
         };
-        purge_expired(entry, now_secs, ttl_secs);
-
         entry
             .messages
             .iter()
@@ -330,19 +425,17 @@ impl DropStore {
         now: SystemTime,
     ) -> Result<(), DropError> {
         self.touch_channel(id);
+        self.purge_channel(id, unix_secs(now));
 
-        let now_secs = unix_secs(now);
-        let ttl_secs = self.config.message_ttl.as_secs();
         let Some(entry) = self.channels.get_mut(id) else {
             return Err(DropError::MessageNotFound);
         };
-        purge_expired(entry, now_secs, ttl_secs);
-
         let Some(position) = entry.messages.iter().position(|m| m.cursor == cursor) else {
             return Err(DropError::MessageNotFound);
         };
         if let Some(message) = entry.messages.remove(position) {
             entry.total_bytes = entry.total_bytes.saturating_sub(message.body.len());
+            self.total_bytes = self.total_bytes.saturating_sub(message.body.len());
         }
 
         Ok(())
@@ -402,6 +495,66 @@ impl DropStore {
         self.channels.is_empty()
     }
 
+    /// Returns the total number of message body bytes currently held across
+    /// all channels; never exceeds [`DropConfig::max_total_bytes`].
+    pub fn total_stored_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Returns `true` when `additional` more body bytes can be stored without
+    /// exceeding the global byte budget.
+    fn fits_within_global_cap(&self, additional: usize) -> bool {
+        additional <= self.config.max_total_bytes.saturating_sub(self.total_bytes)
+    }
+
+    /// Purges expired messages from a single channel, keeping the precise
+    /// global byte total up to date.
+    fn purge_channel(&mut self, id: &ChannelId, now_secs: u64) {
+        let ttl_secs = self.config.message_ttl.as_secs();
+        if let Some(entry) = self.channels.get_mut(id) {
+            let freed = purge_expired(entry, now_secs, ttl_secs);
+            self.total_bytes = self.total_bytes.saturating_sub(freed);
+        }
+    }
+
+    /// Purges expired messages from every channel, keeping the precise
+    /// global byte total up to date. Channels left empty are kept (and still
+    /// count towards `max_channels`) so their cursors are not reset; they are
+    /// reclaimed by ordinary LRU eviction.
+    fn purge_expired_channels(&mut self, now_secs: u64) {
+        let ttl_secs = self.config.message_ttl.as_secs();
+        let mut freed: usize = 0;
+        for entry in self.channels.values_mut() {
+            freed = freed.saturating_add(purge_expired(entry, now_secs, ttl_secs));
+        }
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
+    }
+
+    /// Evicts the least-recently-used channel and subtracts its bytes from
+    /// the global total. Returns `false` when no live channel could be
+    /// evicted.
+    fn evict_least_recently_used_channel(&mut self) -> bool {
+        while let Some((id, tick)) = self.channel_lru.pop_front() {
+            let is_live = self
+                .channels
+                .get(&id)
+                .is_some_and(|entry| entry.lru_tick == tick);
+            if !is_live {
+                continue;
+            }
+            if let Some(entry) = self.channels.remove(&id) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.total_bytes);
+                // Channel ids are never logged above debug level.
+                tracing::debug!(
+                    channels = self.channels.len(),
+                    "drop store evicted least-recently-used channel"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     fn touch_channel(&mut self, id: &ChannelId) {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
@@ -431,22 +584,7 @@ impl DropStore {
     }
 
     fn evict_channels_to(&mut self, target: usize) {
-        while self.channels.len() > target {
-            let Some((id, tick)) = self.channel_lru.pop_front() else {
-                break;
-            };
-            let is_live = self
-                .channels
-                .get(&id)
-                .is_some_and(|entry| entry.lru_tick == tick);
-            if is_live && self.channels.remove(&id).is_some() {
-                // Channel ids are never logged above debug level.
-                tracing::debug!(
-                    channels = self.channels.len(),
-                    "drop store evicted least-recently-used channel"
-                );
-            }
-        }
+        while self.channels.len() > target && self.evict_least_recently_used_channel() {}
     }
 
     fn evict_rate_entries_to(&mut self, target: usize) {
@@ -495,32 +633,57 @@ pub(crate) fn drop_router(config: &DropConfig) -> Router<AppState> {
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
 }
 
-/// Client IP extractor. Prefers the connection peer address
-/// ([`ConnectInfo`]); when that is unavailable (e.g. behind a reverse proxy or
-/// in in-process tests) falls back to the first `X-Forwarded-For` entry, and
-/// finally to a shared "unknown" bucket. Never rejects.
+/// Client IP extractor for rate limiting.
+///
+/// Uses the connection peer address ([`ConnectInfo`]). `X-Forwarded-For` is
+/// honored only when the peer address is contained in
+/// [`DropConfig::trusted_proxies`], in which case the rightmost hop that is
+/// not itself trusted is used as the client address; from any other peer the
+/// client-spoofable header is ignored. When no peer address is available at
+/// all (e.g. in-process tests), all such requests share a single "unknown"
+/// bucket (`0.0.0.0`). Never rejects.
 pub(crate) struct ClientIp(IpAddr);
 
-impl<S> FromRequestParts<S> for ClientIp
-where
-    S: Send + Sync,
-{
+impl FromRequestParts<AppState> for ClientIp {
     type Rejection = Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        if let Some(ConnectInfo(addr)) = parts.extensions.get::<ConnectInfo<SocketAddr>>() {
-            return Ok(Self(addr.ip()));
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let trusted = &state.config.drop.trusted_proxies;
+        let Some(peer) = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip())
+        else {
+            return Ok(Self(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        };
+        if trusted.iter().any(|net| net.contains(&peer)) {
+            if let Some(client) = forwarded_for(&parts.headers, trusted) {
+                return Ok(Self(client));
+            }
         }
-        if let Some(ip) = forwarded_for(&parts.headers) {
-            return Ok(Self(ip));
-        }
-        Ok(Self(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
+        Ok(Self(peer))
     }
 }
 
-fn forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
+/// Returns the client address from an `X-Forwarded-For` header received from
+/// a trusted proxy: the rightmost hop that is not itself a trusted proxy.
+/// Falls back to the leftmost hop when every listed hop is trusted, and to
+/// `None` when the header is absent or holds no parseable address.
+fn forwarded_for(headers: &HeaderMap, trusted: &[IpNet]) -> Option<IpAddr> {
     let value = headers.get("x-forwarded-for")?.to_str().ok()?;
-    value.split(',').next()?.trim().parse().ok()
+    let hops: Vec<IpAddr> = value
+        .split(',')
+        .filter_map(|hop| hop.trim().parse().ok())
+        .collect();
+    for hop in hops.iter().rev() {
+        if !trusted.iter().any(|net| net.contains(hop)) {
+            return Some(*hop);
+        }
+    }
+    hops.first().copied()
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,8 +730,18 @@ async fn put_handler(
         Err(
             error @ (DropError::ChannelMessageLimit { .. } | DropError::ChannelByteLimit { .. }),
         ) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error @ (DropError::StorageExhausted { .. } | DropError::CursorExhausted)) => {
+            (StatusCode::INSUFFICIENT_STORAGE, error.to_string()).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed to store message").into_response(),
     }
+}
+
+/// Encodes poll results for the wire as deterministic CBOR: a
+/// definite-length array of the integer-keyed maps documented on
+/// [`DropMessage`].
+fn encode_messages(messages: &[DropMessage]) -> Result<Vec<u8>, serde_cbor::Error> {
+    serde_cbor::to_vec(&messages)
 }
 
 async fn get_handler(
@@ -588,7 +761,7 @@ async fn get_handler(
     let messages = store.poll(&id, query.since, limit, SystemTime::now());
     drop(store);
 
-    match serde_cbor::to_vec(&messages) {
+    match encode_messages(&messages) {
         Ok(bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/cbor")],
@@ -642,7 +815,10 @@ fn unix_secs(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-fn purge_expired(entry: &mut ChannelEntry, now_secs: u64, ttl_secs: u64) {
+/// Removes expired messages from the front of a channel and returns the
+/// number of body bytes freed.
+fn purge_expired(entry: &mut ChannelEntry, now_secs: u64, ttl_secs: u64) -> usize {
+    let mut freed: usize = 0;
     // Messages are appended in timestamp order, so scanning from the front is
     // sufficient.
     while let Some(front) = entry.messages.front() {
@@ -650,9 +826,11 @@ fn purge_expired(entry: &mut ChannelEntry, now_secs: u64, ttl_secs: u64) {
             break;
         }
         if let Some(message) = entry.messages.pop_front() {
-            entry.total_bytes = entry.total_bytes.saturating_sub(message.body.len());
+            freed = freed.saturating_add(message.body.len());
         }
     }
+    entry.total_bytes = entry.total_bytes.saturating_sub(freed);
+    freed
 }
 
 #[cfg(test)]
@@ -673,16 +851,62 @@ mod tests {
         axum_test::TestServer::new(app).expect("test server")
     }
 
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct WireMessage {
-        cursor: u64,
-        ts: u64,
-        #[serde(with = "serde_bytes")]
-        body: Vec<u8>,
+    /// Builds a test server whose requests all carry the given connection
+    /// peer address, simulating a deployment behind a (reverse proxy) peer.
+    fn test_server_with_peer(config: DropConfig, peer: IpAddr) -> axum_test::TestServer {
+        use axum::{extract::Request, middleware};
+
+        let relay_config = Config {
+            drop: config,
+            ..Config::default()
+        };
+        let (app, _) = HttpRelay::create_app(relay_config).expect("create app");
+        let app = app.layer(middleware::from_fn(
+            move |mut request: Request, next: middleware::Next| async move {
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::new(peer, 4321)));
+                next.run(request).await
+            },
+        ));
+        axum_test::TestServer::new(app).expect("test server")
     }
 
-    fn decode_wire(bytes: &[u8]) -> Vec<WireMessage> {
-        serde_cbor::from_slice(bytes).expect("valid cbor response")
+    /// Decodes a `GET` response using the documented integer-keyed schema
+    /// (`0`: cursor, `1`: ts, `2`: body); panics on any other shape.
+    fn decode_wire(bytes: &[u8]) -> Vec<DropMessage> {
+        use serde_cbor::Value;
+
+        let value: Value = serde_cbor::from_slice(bytes).expect("valid cbor response");
+        let Value::Array(items) = value else {
+            panic!("response must be a CBOR array");
+        };
+        items
+            .into_iter()
+            .map(|item| {
+                let Value::Map(entries) = item else {
+                    panic!("item must be a CBOR map");
+                };
+                let (mut cursor, mut ts, mut body) = (None, None, None);
+                for (key, value) in entries {
+                    match (key, value) {
+                        (Value::Integer(0), Value::Integer(v)) => {
+                            cursor = Some(u64::try_from(v).expect("non-negative cursor"));
+                        }
+                        (Value::Integer(1), Value::Integer(v)) => {
+                            ts = Some(u64::try_from(v).expect("non-negative ts"));
+                        }
+                        (Value::Integer(2), Value::Bytes(bytes)) => body = Some(bytes),
+                        (key, value) => panic!("unexpected entry ({key:?}, {value:?})"),
+                    }
+                }
+                DropMessage {
+                    cursor: cursor.expect("cursor key present"),
+                    ts: ts.expect("ts key present"),
+                    body: body.expect("body key present"),
+                }
+            })
+            .collect()
     }
 
     // --- ChannelId ---
@@ -892,6 +1116,210 @@ mod tests {
         store.record_write(ip, later).expect("window reset");
     }
 
+    #[test]
+    fn global_byte_cap_evicts_lru_channels_and_is_never_exceeded() {
+        let config = DropConfig {
+            max_total_bytes: 100,
+            max_bytes_per_channel: 100,
+            max_body_bytes: 100,
+            ..DropConfig::default()
+        };
+        let mut store = DropStore::new(config);
+        let now = SystemTime::now();
+
+        // Fill past the cap with many channels; the global total must never
+        // exceed the cap.
+        for byte in 0u8..20 {
+            let id = ChannelId([byte; 32]);
+            store
+                .append(id, vec![byte; 30], now)
+                .expect("append within global cap");
+            assert!(
+                store.total_stored_bytes() <= 100,
+                "global byte cap exceeded"
+            );
+        }
+
+        // Only the three most recent 30-byte channels fit (90 bytes); the
+        // older ones were evicted least-recently-used first.
+        assert_eq!(store.channel_count(), 3);
+        assert_eq!(store.total_stored_bytes(), 90);
+        assert!(!store.channels.contains_key(&ChannelId([0u8; 32])));
+        assert!(!store.channels.contains_key(&ChannelId([16u8; 32])));
+        assert!(store.channels.contains_key(&ChannelId([17u8; 32])));
+        assert_eq!(store.poll(&ChannelId([19u8; 32]), None, 50, now).len(), 1);
+    }
+
+    #[test]
+    fn global_byte_cap_purges_expired_before_evicting() {
+        let config = DropConfig {
+            message_ttl: Duration::from_secs(10),
+            max_total_bytes: 100,
+            max_bytes_per_channel: 100,
+            max_body_bytes: 100,
+            ..DropConfig::default()
+        };
+        let mut store = DropStore::new(config);
+        let now = SystemTime::now();
+        let live = ChannelId([91u8; 32]);
+        let expiring = ChannelId([90u8; 32]);
+        let new = ChannelId([92u8; 32]);
+
+        store.append(expiring, vec![0u8; 40], now).expect("append");
+        store
+            .append(live, vec![0u8; 40], now + Duration::from_secs(2))
+            .expect("append");
+        // Make `live` the least-recently-used channel: without purge-first
+        // the append below would evict `live` instead of the expired data.
+        let mid = now + Duration::from_secs(2);
+        store.poll(&live, None, 50, mid);
+        store.poll(&expiring, None, 50, mid);
+
+        let later = now + Duration::from_secs(11);
+        store
+            .append(new, vec![0u8; 60], later)
+            .expect("expired bytes are reclaimed first");
+
+        // The expired channel's messages were purged instead of evicting the
+        // live channel.
+        assert_eq!(store.poll(&live, None, 50, later).len(), 1);
+        assert!(store.poll(&expiring, None, 50, later).is_empty());
+        assert_eq!(store.total_stored_bytes(), 100);
+    }
+
+    #[test]
+    fn append_rejects_message_larger_than_global_cap() {
+        let config = DropConfig {
+            max_total_bytes: 10,
+            max_bytes_per_channel: 100,
+            max_body_bytes: 100,
+            ..DropConfig::default()
+        };
+        let mut store = DropStore::new(config);
+        let id = ChannelId([40u8; 32]);
+
+        let err = store
+            .append(id, vec![0u8; 11], SystemTime::now())
+            .expect_err("single message larger than the global cap");
+        assert_eq!(err, DropError::StorageExhausted { max: 10 });
+        assert_eq!(store.total_stored_bytes(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn put_sweeps_expired_channels_once_half_full() {
+        let config = DropConfig {
+            message_ttl: Duration::from_secs(10),
+            max_total_bytes: 100,
+            max_bytes_per_channel: 100,
+            max_body_bytes: 100,
+            ..DropConfig::default()
+        };
+        let a = ChannelId([60u8; 32]);
+        let b = ChannelId([61u8; 32]);
+        let now = SystemTime::now();
+        let later = now + Duration::from_secs(11);
+
+        // Over 50% full: the PUT sweeps expired bytes from all channels.
+        let mut store = DropStore::new(config.clone());
+        store.append(a, vec![0u8; 60], now).expect("append");
+        store.append(b, vec![0u8; 10], later).expect("append");
+        assert_eq!(store.total_stored_bytes(), 10);
+
+        // Under 50% full: no sweep runs and expired bytes linger lazily until
+        // the expired channel itself is touched.
+        let mut store = DropStore::new(config);
+        store.append(a, vec![0u8; 40], now).expect("append");
+        store.append(b, vec![0u8; 5], later).expect("append");
+        assert_eq!(store.total_stored_bytes(), 45);
+        assert!(store.poll(&a, None, 50, later).is_empty());
+        assert_eq!(store.total_stored_bytes(), 5);
+    }
+
+    #[test]
+    fn append_at_cursor_max_fails_instead_of_wrapping() {
+        let mut store = DropStore::new(DropConfig::default());
+        let id = ChannelId([70u8; 32]);
+        let now = SystemTime::now();
+
+        store.append(id, b"a".to_vec(), now).expect("append");
+        store
+            .channels
+            .get_mut(&id)
+            .expect("channel exists")
+            .next_cursor = u64::MAX;
+
+        let err = store
+            .append(id, b"b".to_vec(), now)
+            .expect_err("cursor space is exhausted");
+        assert_eq!(err, DropError::CursorExhausted);
+
+        // The failed append did not wrap the cursor or store anything.
+        let messages = store.poll(&id, None, 50, now);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cursor, 0);
+    }
+
+    #[test]
+    fn wire_encoding_is_deterministic_integer_keyed_cbor() {
+        let messages = vec![
+            DropMessage {
+                cursor: 0,
+                ts: 42,
+                body: b"hi".to_vec(),
+            },
+            DropMessage {
+                cursor: 1,
+                ts: 43,
+                body: Vec::new(),
+            },
+        ];
+        let bytes = encode_messages(&messages).expect("encode");
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0x82, // array(2)
+            0xa3, 0x00, 0x00, 0x01, 0x18, 0x2a, 0x02, 0x42, b'h', b'i',
+            0xa3, 0x00, 0x01, 0x01, 0x18, 0x2b, 0x02, 0x40,
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn forwarded_for_selects_rightmost_untrusted_hop() {
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().expect("valid ipnet")];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.1, 198.51.100.9, 10.1.2.3"
+                .parse()
+                .expect("header value"),
+        );
+        assert_eq!(
+            forwarded_for(&headers, &trusted),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)))
+        );
+
+        // Every listed hop trusted: fall back to the leftmost (original
+        // client as reported by the outermost trusted proxy).
+        headers.insert(
+            "x-forwarded-for",
+            "10.1.1.1, 10.2.2.2".parse().expect("header value"),
+        );
+        assert_eq!(
+            forwarded_for(&headers, &trusted),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)))
+        );
+
+        // Absent or unparseable headers yield no address.
+        assert_eq!(forwarded_for(&HeaderMap::new(), &trusted), None);
+        headers.insert(
+            "x-forwarded-for",
+            "not-an-ip".parse().expect("header value"),
+        );
+        assert_eq!(forwarded_for(&headers, &trusted), None);
+    }
+
     // --- Manifest ---
 
     #[test]
@@ -1009,6 +1437,86 @@ mod tests {
                 .await;
             assert_eq!(response.status_code(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn put_returns_507_when_message_exceeds_global_byte_cap() {
+        let config = DropConfig {
+            max_total_bytes: 10,
+            max_bytes_per_channel: 100,
+            max_body_bytes: 100,
+            ..DropConfig::default()
+        };
+        let server = test_server(config);
+        let channel = encode_id(50);
+
+        let response = server
+            .put(&format!("/drop/{channel}"))
+            .bytes(vec![0u8; 11].into())
+            .await;
+        assert_eq!(response.status_code(), 507);
+
+        // A message that fits is still accepted.
+        let response = server
+            .put(&format!("/drop/{channel}"))
+            .bytes(vec![0u8; 10].into())
+            .await;
+        assert_eq!(response.status_code(), 201);
+    }
+
+    #[tokio::test]
+    async fn spoofed_xff_from_untrusted_peer_is_ignored() {
+        let config = DropConfig {
+            write_rate_limit: 2,
+            write_rate_window: Duration::from_secs(60),
+            ..DropConfig::default()
+        };
+        let server = test_server_with_peer(config, IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)));
+        let channel = encode_id(80);
+
+        // Three requests with different spoofed XFF values: if the header
+        // were honored each would get its own rate bucket and all would
+        // succeed. The untrusted peer address is used instead, so the third
+        // write is rate limited.
+        for (xff, expected) in [("1.1.1.1", 201), ("2.2.2.2", 201), ("3.3.3.3", 429)] {
+            let response = server
+                .put(&format!("/drop/{channel}"))
+                .add_header("x-forwarded-for", xff)
+                .bytes(Bytes::from_static(b"x"))
+                .await;
+            assert_eq!(response.status_code(), expected, "xff {xff}");
+        }
+    }
+
+    #[tokio::test]
+    async fn xff_from_trusted_proxy_is_honored() {
+        let config = DropConfig {
+            write_rate_limit: 1,
+            write_rate_window: Duration::from_secs(60),
+            trusted_proxies: vec!["10.0.0.0/8".parse().expect("valid ipnet")],
+            ..DropConfig::default()
+        };
+        let server = test_server_with_peer(config, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let channel = encode_id(81);
+
+        // Two different client addresses behind the trusted proxy get
+        // separate rate buckets: both succeed despite write_rate_limit = 1.
+        for xff in ["198.51.100.1", "198.51.100.2"] {
+            let response = server
+                .put(&format!("/drop/{channel}"))
+                .add_header("x-forwarded-for", xff)
+                .bytes(Bytes::from_static(b"x"))
+                .await;
+            assert_eq!(response.status_code(), 201, "xff {xff}");
+        }
+
+        // A second write from the same forwarded client is rate limited.
+        let response = server
+            .put(&format!("/drop/{channel}"))
+            .add_header("x-forwarded-for", "198.51.100.1")
+            .bytes(Bytes::from_static(b"x"))
+            .await;
+        assert_eq!(response.status_code(), 429);
     }
 
     #[tokio::test]
