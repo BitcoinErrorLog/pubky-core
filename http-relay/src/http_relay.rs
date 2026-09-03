@@ -1,4 +1,4 @@
-//! https://httprelay.io/features/link/
+//! <https://httprelay.io/features/link/>
 
 use std::{
     net::{SocketAddr, TcpListener},
@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use url::Url;
 
+use crate::drop::{drop_router, DropStore};
 use crate::waiting_list::WaitingList;
 
 /// The timeout for a request to be considered unused.
@@ -28,14 +29,16 @@ use crate::waiting_list::WaitingList;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     pub config: Config,
     pub pending_list: Arc<Mutex<WaitingList>>,
+    pub drop_store: Arc<Mutex<DropStore>>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
         Self {
+            drop_store: Arc::new(Mutex::new(DropStore::new(config.drop.clone()))),
             config,
             pending_list: Arc::new(Mutex::new(WaitingList::default())),
         }
@@ -43,9 +46,10 @@ impl AppState {
 }
 
 #[derive(Debug, Clone)]
-struct Config {
+pub(crate) struct Config {
     pub http_port: u16,
     pub request_timeout: Duration,
+    pub drop: crate::drop::DropConfig,
 }
 
 impl Default for Config {
@@ -53,6 +57,7 @@ impl Default for Config {
         Self {
             http_port: 0,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            drop: crate::drop::DropConfig::default(),
         }
     }
 }
@@ -84,7 +89,7 @@ pub struct HttpRelay {
 impl HttpRelay {
     /// Creates the HTTP router for the HTTP relay.
     /// Extracted as its own function to make it easier to test.
-    fn create_app(config: Config) -> Result<(Router, AppState)> {
+    pub(crate) fn create_app(config: Config) -> Result<(Router, AppState)> {
         let app_state = AppState::new(config);
 
         let app = Router::new()
@@ -92,6 +97,7 @@ impl HttpRelay {
                 "/link/{id}",
                 get(link::get_handler).post(link::post_handler),
             )
+            .merge(drop_router(&app_state.config.drop))
             .layer(CorsLayer::very_permissive())
             .layer(TraceLayer::new_for_http())
             .with_state(app_state.clone());
@@ -111,7 +117,7 @@ impl HttpRelay {
         tokio::spawn(async move {
             axum_server::from_tcp(http_listener)
                 .handle(http_handle.clone())
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .map_err(|error| tracing::error!(?error, "HttpRelay http server error"))
         });
@@ -282,8 +288,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_timeout() {
-        let mut config = Config::default();
-        config.request_timeout = Duration::from_millis(50);
+        let config = Config {
+            request_timeout: Duration::from_millis(50),
+            ..Config::default()
+        };
         let (app, state) = HttpRelay::create_app(config).unwrap();
         let server = axum_test::TestServer::new(app).unwrap();
 
