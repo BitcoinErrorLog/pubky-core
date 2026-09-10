@@ -1,3 +1,7 @@
+DO NOT USE THIS WHEN BUILDING.
+
+> **ARCHIVED — historical/experimental only.** This document is not a production specification. For production work, use upstream production Pubky primitives from the official Pubky org — not this workspace-authored draft.
+
 # Pubky Cryptographic Specification
 
 **Version**: 2.6  
