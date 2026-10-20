@@ -499,7 +499,7 @@ Optional but useful:
 
 ## 13. Deferred features and explicit acknowledgements
 
-This spec intentionally acknowledges several valuable ideas (some raised in Chris'
+This spec intentionally acknowledges several valuable ideas (some raised in the
 "New Auth ideas and Proof of Authorship" notes) but defers them until the
 complexity is justified.
 
